@@ -122,6 +122,38 @@ Backend /v1/identify is now wired and ready; flip iOS to live mode (APIClient + 
 
 ml-retrieval-engineer fixed SigLIP embedder `.pooler_output` crash and Met HTTP 406 errors. Met Museum corpus can now be ingested end-to-end. Backend embedder cache should warm cleanly at startup. No iOS code changes needed; update backend URL to `http://localhost:8000` when ready to test live.
 
+### 2026-05-10 — Live-mode debug: three simultaneous fixes
+
+**Root cause identified:** `IdentifyResponse.Codable` was written for a flat schema
+(`status`, `top_candidate`, `alternates` at the top level) but the server returns a nested
+`match` envelope per `docs/api.md`. `JSONDecoder` threw `keyNotFound` on the missing `status`
+key at the top level → `.decoding` error → "unexpected response" screen.
+
+**Secondary bug:** `ArtworkCandidate` used `case confidence` (decoding JSON key "confidence")
+but the server sends `"score"` per candidate. Fixed to `case confidence = "score"`.
+
+**Defensive fix:** `Info.plist` had no `NSAppTransportSecurity` entry, so iOS would block
+`http://localhost:8000` at ATS before any request left the Simulator. Added
+`NSAllowsLocalNetworking: true`.
+
+**Diagnostics hardened:**
+- `ArtGuideApp.init()` prints the resolved `AppConfig.apiBaseURL` on launch (`#if DEBUG`).
+- `APIClient` decode catch blocks print the full `DecodingError` + first 500 chars of raw body.
+- `APIError.decoding.userFacingMessage` surfaces the error detail on screen in DEBUG builds.
+
+**Files changed:**
+- `Models/IdentifyResponse.swift` — full rewrite; new `MatchEnvelope` struct; computed
+  view accessors (`status`, `topCandidate`, `alternates`, `disclaimer`, `style`) preserve
+  all view and MockData call sites with no changes required there.
+- `Models/ArtworkCandidate.swift` — CodingKey: `case confidence = "score"`.
+- `Models/APIError.swift` — DEBUG-aware `decoding` message.
+- `Info.plist` — `NSAllowsLocalNetworking: true`.
+- `ArtGuideApp.swift` — launch-time URL print.
+- `Networking/APIClient.swift` — decode error + raw body logging.
+
+**Skill captured:** `.squad/skills/ios-local-dev/SKILL.md` — "The three things that
+silently break local dev" (ATS, Codable mismatch, xcconfig propagation).
+
 ### 2026-05-10 — `/v1/identify` end-to-end live: transformers 5.x compatibility fixed
 
 **For iOS:** Backend endpoint is now fully operational with real Met artwork matching and confidence-aware status. Exception handling improved (PIL decode errors 400, embedding failures 500). You can now flip `MockAPIClient` → `APIClient` in `ArtGuideApp.swift` and test real end-to-end flows with local or prod backend. Status-aware guardrails applied to LLM explanations; query path fully tested.
