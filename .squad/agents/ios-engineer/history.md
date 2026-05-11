@@ -89,3 +89,29 @@ iOS readiness: scaffold complete, awaiting project owner Xcode setup.
 - Conform to `docs/image-pipeline.md` for upload rules.
 - Surface uncertainty visibly. Never overclaim confidence.
 
+
+### 2026-05-10 — XcodeGen is now the source of truth for the iOS project
+
+- Replaced the manual "create project in Xcode UI, move .xcodeproj, re-import sources, fix Info.plist + xcconfig" dance with a one-shot generator:
+  - `apps/ios/project.yml` — XcodeGen spec (project name, target, bundle id `com.maxmontes.artguide`, iOS 16, Swift 5.9, automatic signing with empty `DEVELOPMENT_TEAM`, scheme env var `ART_GUIDE_MOCK_SCENARIO=cycle` pre-declared).
+  - `apps/ios/setup.sh` — runs `xcodegen generate` after a `command -v` check; prints brew-install hint if missing.
+  - `apps/ios/README.md` rewritten around the new "Quick start: `brew install xcodegen && cd apps/ios && ./setup.sh && open ArtGuide.xcodeproj`" flow.
+  - `.gitignore` now excludes `apps/ios/ArtGuide.xcodeproj/`, `*.xcuserdata*`, and `Config.local.xcconfig`. The .xcodeproj is a build artifact.
+- Critical gotcha encoded in the spec: `GENERATE_INFOPLIST_FILE = NO` + `INFOPLIST_FILE = ArtGuide/Info.plist`. Xcode's default of auto-generating an Info.plist silently shadows the on-disk one, dropping camera/photo permission strings and the `API_BASE_URL`/`API_KEY` keys. That was the root cause of the previous walkthrough's friction.
+- Could not run `xcodegen` on this machine — not installed, and per task rules I did not `brew install` without max-montes' consent. YAML and shell syntax both pass static checks. First validation will happen when max-montes runs `./setup.sh`.
+- Decision queued: `.squad/decisions/inbox/ios-engineer-xcodegen.md` (Active, owner ios-engineer).
+- Skill captured: `.squad/skills/xcodegen-app-spec/SKILL.md` — reusable shape for "existing Info.plist + xcconfig + scheme env var" XcodeGen specs.
+
+## Learnings
+
+- **XcodeGen is the v1 iOS project-generation tool.** The .xcodeproj is a build artifact derived from `apps/ios/project.yml`. Edit the spec, re-run `apps/ios/setup.sh`. Never edit the .xcodeproj by hand.
+- **`GENERATE_INFOPLIST_FILE` defaults to YES and silently shadows on-disk Info.plist.** The spec forces it OFF and pins `INFOPLIST_FILE = ArtGuide/Info.plist`. Anyone touching the spec must keep both settings in place or the camera/photo permission strings and API config keys disappear from the built app.
+- **xcconfig wiring lives at the target level via `configFiles:`** — same file for Debug and Release; per-developer overrides go in the gitignored `Config.local.xcconfig` next to it.
+- **Scheme env vars are first-class in XcodeGen.** `ART_GUIDE_MOCK_SCENARIO` is pre-declared so testers flip statuses via Edit Scheme → Run → Environment Variables without recompiling.
+- **Default-argument accessibility rule (single-target apps).** Swift requires default values in a function/initializer signature to be at least as accessible as the signature itself. A `public init` whose default args reference internal types (e.g. `AppConfig.apiBaseURL`) won't compile. In a single-target iOS app there's no module boundary to cross, so `public` adds no value and just creates these traps — keep classes/inits at the default `internal` access. Surfaced when `apps/ios/ArtGuide/Networking/APIClient.swift` was marked `public` while `AppConfig` was `internal`; fixed by stripping `public` from `APIClient` and its members (Option A). `MockAPIClient` was unaffected because `MockData` is already `public`.
+
+---
+
+### 2026-05-11 — Backend `/v1/identify` live, ready to flip to APIClient
+
+Backend /v1/identify is now wired and ready; flip iOS to live mode (APIClient + Config.xcconfig http://localhost:8000) to test end-to-end.

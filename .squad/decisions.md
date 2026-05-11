@@ -179,6 +179,48 @@ The spec encodes the painful settings explicitly:
 ## D-018 — Met Open Access ingest pipeline (fetch → embed → upsert)
 **Decision:** The Met ingest job lives in `services/ml/ml/ingest/met_db.py` with CLI `art-guide-ml ingest met [--limit N] [--dry-run] [--database-url DSN] [--batch-commit-size N] [--department-ids ID,ID,…] [--jsonl-out PATH]`. Filters: `isPublicDomain=true`, `hasImages=true`, optional `departmentIds`, classification substring match (painting/sculpture vocabulary), and non-empty `primaryImage` URL. Field mapping: `id=met:{objectID}`, `source="met"`, `source_id=objectID`, `title`, `artist`, `date` (free text), `medium`, `culture`, `period`, `museum="The Metropolitan Museum of Art"`, `source_url`, `image_url` (public URL only, no bytes stored), `tags` (order-preserving union of department+classification+objectName+culture+period+tags[].term), `is_public_domain=true`, `raw_metadata` (jsonb: thumbnail_url, license, license_url, met). Embedding: SigLIP base 224, D=768, L2-normalized. Idempotency: `INSERT … ON CONFLICT (source, source_id) DO UPDATE SET …`; upsert is repeatable (safe to re-run on new embedding model rollout). Image handling: bytes flow museum URL → httpx → embed → cleared (never logged, written, or returned; hard rule #3). Preprocessing: no image decode in orchestrator; `embedder.embed_bytes` calls `prepare_for_embedding` (hard rule #4). Performance: 50 rows/txn, 0.15s request delay (≈6 req/s), exponential backoff, L2 norm logged. License: CC0 (Met Open Access); user-agent identifies project; museum-hosted URLs only. Captures `museum-ingest-loop` skill for Rijks/Harvard/Smithsonian/AIC/Cleveland Phase 4 adapters. Risk: classification vocabulary tuned to current Met edge cases; new cases surface as recall gaps in eval (expand vocabulary, not schema). Constraint conformance: D-002, D-004, D-005, D-006, D-009, D-012, D-015, D-016. **Owner:** ml-retrieval-engineer. **Status:** Active.
 
+## D-019 — Backend `/v1/identify` end-to-end pipeline
+**Decision:** Wire `POST /v1/identify` end-to-end as the canonical retrieval+RAG pipeline, owned by the FastAPI service. The route is the single seam through which a user image becomes a grounded explanation. Stub from `_hardcoded_irises_response` is removed.
+
+### End-to-end request flow
+1. **Validation** — multipart `image` (jpeg/png/heic, ≤10 MiB), optional `client_request_id` (≤64 chars). Bearer auth + 10 req/5 min sliding window enforced by middleware.
+2. **Embedder** — process-local cache warmed once in FastAPI lifespan via `warm_embedder()`, never per-request. Route reads `get_cached_embedder()`. Failure → `503 service_unavailable`.
+3. **Decode + preprocess** — single `ml.imageops.prepare_for_embedding` function (hard rule #4). Bytes explicitly cleared after preprocessing; never written to disk.
+4. **Embed** — CHW → pixel values → forward pass → L2-normalize → 768-dim `np.float32` per D-015.
+5. **Retrieve** — `ArtworkRepository.nearest_neighbors(vec, k=5)` using pgvector `embedding <=> $1::vector` over HNSW cosine index. Up to 5 rows, ordered by distance ascending.
+6. **Confidence map** — `similarities = 1 - distance` (clamped [0,1]). `top_score = sims[0]`, `gap = sims[0] - sims[1]`. Empty rows → `top_score=0.0, gap=0.0` → `no_match` path.
+7. **Status** — `map_status_and_confidence(top_score, gap, thresholds)` per D-005: `exact` (≥0.85 + gap≥0.05), `likely` (≥0.70), `style_only` (≥0.55), else `no_match`.
+8. **Candidates** — top 1 unless `likely` + gap<0.05, then top 3. `no_match` → `[]`.
+9. **Explanation** — `no_match` → canned re-shoot text (no LLM). Else: `build_prompt(record, status)` with status-specific guardrails (exact: "plainly", likely: "hedge", style_only: "resembles only") → Azure OpenAI. LLM failure is non-fatal: caught, logged, replaced with deterministic stub built from record fields; match still returned.
+10. **Response** — `IdentifyResponse` validates against JSON schema. Tone `museum_guide`, length `short` server-locked (D-007). `diagnostics` report timings. `model_versions.embedding="siglip-base-224"`, `model_versions.llm="azure-openai:..."` or `"not-configured"`.
+11. **Logging** — one structured log per request (request_id, status, confidence, scores, timings, model versions, llm_called, llm_error). **Never logs image bytes** (D-012). Sampled second line reports which fields were used.
+
+### Threshold values (exposed via Settings, defaults match D-005)
+- `CONFIDENCE_EXACT_THRESHOLD` = 0.85
+- `CONFIDENCE_LIKELY_THRESHOLD` = 0.70
+- `CONFIDENCE_STYLE_ONLY_THRESHOLD` = 0.55
+- `CONFIDENCE_LIKELY_AMBIGUOUS_GAP` = 0.05
+
+### LLM guardrail contract
+- Prompt never contains world-knowledge preamble (enforced by test).
+- Metadata block lists ONLY populated record fields (enforced by test).
+- Status-specific guardrails (exact/likely/style_only) baked into template.
+- `no_match` never calls LLM; raises ValueError if attempted.
+- Grounding: every named title/artist in explanation comes from record by construction, composing with planned `field_citation` + `confidence_honesty` evaluators.
+
+### Embedder cache pattern
+Module-global cache in `app/embedding.py` (survives test-client lifespan boundaries). Loaded lazily (import torch/transformers only inside function; API and default tests don't require them). Sticky failure flag avoids re-attempting heavy import per request when model is missing.
+
+### Operational
+- Local dev: `pip install -e .[dev] && pip install -e ../ml`. Without `ml`, /v1/identify returns 503.
+- Empty Postgres: route returns `no_match` cleanly (verified by unit test).
+- Tests: 65 passing, 2 integration-deselected. Default suite needs no torch, DB, or Azure creds.
+
+### Constraint conformance
+D-002 (retrieval-first), D-003 (single service), D-005 (confidence), D-007 (API), D-008 (rate limit), D-012 (privacy), D-015 (SigLIP-768), D-016 (schema).
+
+**Owner:** backend-engineer. **Status:** Active. **Date:** 2026-05-10.
+
 ## Governance
 
 - All meaningful changes require explicit decisions here.

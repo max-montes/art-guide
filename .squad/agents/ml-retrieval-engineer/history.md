@@ -80,3 +80,68 @@
 
 **Your next:** Wire `imageops.prepare_for_embedding` into the Met ingest path to generate embeddings. Implement `services/ml/ml/vector_store.py` (`ArtworkVectorStore` with insert + ANN search). Bootstrap real augmented eval set from Met references. Then ingest → DB pipeline is complete.
 
+### 2026-05-10 — Met → embed → DB ingest landed
+
+**Shipped:** `services/ml/ml/ingest/met_db.py` (sibling to the existing fetch-only `met.py`) with the end-to-end loop: discover via `/objects` → fetch `/objects/{id}` → filter (public-domain + has-image + paintings/sculpture classification) → in-memory image download → `embedder.embed_bytes` → batched `INSERT … ON CONFLICT (source, source_id) DO UPDATE`. Image bytes never touch disk; `img_bytes` is dropped immediately after `embed_bytes` returns (D-012 / hard rule #3 honored). The orchestrator routes preprocessing through `prepare_for_embedding` indirectly via `get_embedder()` so the one-pipeline rule still holds.
+
+**CLI:** wired into `art-guide-ml ingest met`. Default behavior is now DB ingest (limit 100 unless overridden). Flags:
+- `--limit N` (default 100 in DB mode; unlimited for `--jsonl-out`)
+- `--dry-run` (fetch + download + embed without DB writes — used when no Postgres is available)
+- `--database-url DSN` (overrides `$DATABASE_URL` and the local docker-compose default)
+- `--batch-commit-size N` (default 50)
+- `--department-ids 11,21` (Met department pre-filter — see below)
+- `--jsonl-out PATH` (legacy normalize-only; preserved for offline data exploration)
+
+**Smoke test result (no Docker available in this env):** ran `art-guide-ml ingest met --limit 1 --dry-run` against the live Met API. The /objects feed returned **501,514** candidate IDs; the script fetched 521 records before one passed the painting/sculpture classifier — `met:466` "Plaque Portrait of Benjamin Franklin" — embedded with `vec_norm = 1.0000` (L2-normalized, as the embedder contract guarantees). One transient 403 in the middle was retried successfully on the first backoff.
+
+**Schema fit:** the artworks columns matched everything we needed except `thumbnail_url`, `license`, and `license_url`. Per the rule "no schema changes without a 0002 migration", those three (plus the full raw Met JSON) live inside `raw_metadata` (jsonb) under keys `thumbnail_url`, `license`, `license_url`, `met`. If Phase 4 adds another source that also wants these as first-class columns, that's a 0002 migration request — flagged in the inbox decision.
+
+**Idempotency:** ON CONFLICT target is `(source, source_id)`. Re-running the script just refreshes the embedding (and any metadata changes from the museum side) for existing rows. Verified by reading the upsert RETURNING `(xmax = 0)` to count inserts vs. updates separately. `id` is rewritten by the conflict clause to keep the namespaced key consistent if anyone ever changes the id format.
+
+**Tests:** 16 new unit tests cover the pure mapper (`map_met_record`) — happy path, every filter rejection branch, optional-field nulling, and `format_pgvector`. Live Met API and live Postgres tests are intentionally omitted (network/DB are operator-driven smoke tests). Total ML suite: 31 green.
+
+## Learnings
+
+### Met API quirks worth knowing
+
+- `GET /objects?isPublicDomain=true&hasImages=true` returns **the entire ID list at once** (501K+ ids). There is no pagination cursor. Without a `departmentIds` filter, the `classification` field is the only way to narrow to paintings/sculpture, and it has to happen client-side per object — that's a ~95% reject rate before you even get to the embedder. **Always pass `--department-ids` for non-trivial runs.** Useful starting set: `11` (European Paintings), `21` (Modern and Contemporary Art), `9` (Drawings & Prints — skip), `4` (American Decorative Arts), `13` (Greek and Roman Art — sculpture-heavy). Confirm exact ids per Met's `/departments` endpoint.
+- `classification` is inconsistent: many sculptures are typed as `"Sculpture"`, but plenty come through as `"Statuettes"`, `"Reliefs"`, `"Bust"`, even `"Carvings-Architectural"`. The substring match in `_classification_matches` is intentionally permissive; tightening it loses real records.
+- Per-object 403s appear sporadically (saw one at id 454 during smoke test). Backoff + retry handled it; the second attempt was a clean 200. Don't treat them as deny — treat as transient.
+- Met has no published rate limit, but at ~3.5 req/s sustained the API stayed healthy for the duration. Keep `request_delay = 0.15s` (≈6 req/s ceiling); revisit if 429s start appearing at scale.
+- `objectURL` is reliably present, but I added a fallback that constructs `https://www.metmuseum.org/art/collection/search/{id}` just in case — saw one record in the wild with empty `objectURL`.
+
+### Performance notes
+
+- Batch commit size 50 / txn is plenty: the bottleneck is single-record HTTP + embed (~250–400 ms each at 6 req/s with SigLIP CPU embed taking ~120 ms). DB write is microseconds by comparison. Don't bother increasing past 50; you'll just hold rows in memory longer.
+- `asyncio.to_thread(embedder.embed_bytes, ...)` keeps the event loop responsive while PyTorch chews on the image. Without it the Met HTTP fetches stall behind the embed.
+- Embedder is cached per-process via `get_embedder()`; never reload weights inside the loop.
+
+### CLI invocation cheat-sheet
+
+```
+# Smoke test, no DB needed:
+art-guide-ml ingest met --limit 1 --dry-run
+
+# Real local ingest (requires `cd infra && docker compose up -d` first):
+AUTO_MIGRATE=true art-guide-ml ingest met --limit 100
+
+# Scale run, paintings + sculpture departments only:
+art-guide-ml ingest met --limit 5000 --department-ids 11,21
+
+# Legacy normalize-only (no embeds, no DB):
+art-guide-ml ingest met --limit 200 --jsonl-out data/met/normalized.jsonl
+```
+
+### What this unblocks
+
+- backend-engineer can now wire `/v1/identify`: `embedder.embed_bytes(uploaded_jpeg)` → SQL `ORDER BY embedding <=> $1 LIMIT k` against the populated `artworks` table → confidence math from D-005.
+- Real retrieval-v1 evaluation set can be bootstrapped against live DB content (next on my list).
+- The fetch→preprocess→embed→upsert loop is generic enough to template for the Phase 4 sources (Rijksmuseum, Harvard, Smithsonian, AIC, Cleveland) — captured as the `museum-ingest-loop` skill.
+
+---
+
+### 2026-05-11 — Backend `/v1/identify` wired end-to-end
+
+/v1/identify is now live and queries against the catalog via nearest_neighbors (ORDER BY embedding <=> $1 LIMIT k against HNSW index). Confidence + grounding complete. Ingest next.
+
+
