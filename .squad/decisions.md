@@ -153,6 +153,29 @@ D-003 (single FastAPI service), D-005 (cosine distance, top-K rule at query time
 **References:** D-003, D-005, D-007, D-011, D-012, D-015.
 **Owner:** backend-engineer. **Status:** Active.
 
+## D-017 — XcodeGen is the v1 iOS project-generation tool
+**Decision:** Use [XcodeGen](https://github.com/yonaskolb/XcodeGen) to generate `apps/ios/ArtGuide.xcodeproj` from a checked-in `apps/ios/project.yml` spec. The spec is the source of truth; the generated `.xcodeproj` is a build artifact and is gitignored.
+
+Setup is one command after Homebrew install:
+```bash
+brew install xcodegen
+cd apps/ios && ./setup.sh && open ArtGuide.xcodeproj
+```
+
+The spec encodes the painful settings explicitly:
+- `GENERATE_INFOPLIST_FILE = NO` and `INFOPLIST_FILE = ArtGuide/Info.plist` so the camera/photo permission strings and `API_BASE_URL` / `API_KEY` keys actually ship in the built app.
+- `configFiles:` wires `ArtGuide/Config/Config.xcconfig` for both Debug and Release.
+- Scheme env var `ART_GUIDE_MOCK_SCENARIO` (default `cycle`) is pre-declared so testers can pin a specific match status via Edit Scheme → Run → Environment Variables.
+- Bundle id `com.maxmontes.artguide`, iOS 16 deployment, Swift 5.9, automatic signing with empty `DEVELOPMENT_TEAM` (Xcode auto-fills the developer's personal team on first open).
+
+**Rationale:** Anyone with the repo can regenerate the project deterministically; no Xcode-UI clicking required. Build-setting changes happen in `project.yml` (one PR, reviewable diff) rather than inside the binary `.xcodeproj`. Adding a Swift file under `apps/ios/ArtGuide/` requires no project edits—re-running `./setup.sh` picks it up.
+
+**Consequences:** Adds a one-time tooling dependency: contributors need `xcodegen` installed (`brew install xcodegen`). The `.xcodeproj` is no longer in git, so anyone who opens `apps/ios/` in Xcode without first running `setup.sh` will see "no project"—the README's Quick start covers this.
+
+**Scope:** v1, iOS app only. Backend / ML / infra are unaffected.
+
+**Owner:** ios-engineer. **Status:** Active.
+
 ## Governance
 
 - All meaningful changes require explicit decisions here.
