@@ -226,3 +226,9 @@ D-002 (retrieval-first), D-003 (single service), D-005 (confidence), D-007 (API)
 - All meaningful changes require explicit decisions here.
 - Document architectural decisions here. Operational notes go in agent `history.md`.
 - Supersede with a new D-NNN entry rather than rewriting an old one.
+## D-020 — Transformers 5.x compatibility in embedding pipeline
+**Decision:** Updated `_HFEmbedder._forward` in `services/ml/ml/embeddings.py` to handle both transformers ≤4.46.x (returns plain Tensor from `get_image_features`) and ≥5.x (returns BaseModelOutputWithPooling with `.pooler_output`). The fix checks if output has `.pooler_output` attribute; if so, uses it; otherwise treats return value as the Tensor directly. Also split broad exception handling in `/v1/identify` route into PIL decode failures (400 bad_request) vs. embedding inference failures (500 internal_error), exposing previously hidden model errors.
+**Rationale:** Hard Rule #4 mandates one image pipeline (`prepare_for_embedding → _to_pixel_values → _forward`). When transformers 5.8.0 was installed, the method signature changed but tests and the API query path didn't exercise it end-to-end, masking the incompatibility. Narrow exception boundaries expose bugs earlier.
+**Test coverage:** Added `test_identify_query_code_path_returns_finite_vector` in ML; added `test_identify_real_forward_path_returns_200` in API. Both exercise the real forward path. All 66 API tests pass.
+**Verification:** curl against `/v1/identify` with real JPEG returns 200 with status="likely" and Met candidates.
+**Owner:** ml-retrieval-engineer. **Status:** Resolved. **Date:** 2026-05-10.

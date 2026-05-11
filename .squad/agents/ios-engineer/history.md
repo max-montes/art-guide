@@ -121,3 +121,8 @@ Backend /v1/identify is now wired and ready; flip iOS to live mode (APIClient + 
 ### 2026-05-11 — Ingestion pipeline now fully executable
 
 ml-retrieval-engineer fixed SigLIP embedder `.pooler_output` crash and Met HTTP 406 errors. Met Museum corpus can now be ingested end-to-end. Backend embedder cache should warm cleanly at startup. No iOS code changes needed; update backend URL to `http://localhost:8000` when ready to test live.
+
+### 2026-05-10 — `/v1/identify` end-to-end live: transformers 5.x compatibility fixed
+
+**For iOS:** Backend endpoint is now fully operational with real Met artwork matching and confidence-aware status. Exception handling improved (PIL decode errors 400, embedding failures 500). You can now flip `MockAPIClient` → `APIClient` in `ArtGuideApp.swift` and test real end-to-end flows with local or prod backend. Status-aware guardrails applied to LLM explanations; query path fully tested.
+

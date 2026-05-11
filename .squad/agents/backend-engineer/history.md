@@ -15,6 +15,17 @@
 
 **⚠️ Data pipeline ready:** ML has wired `art-guide-ml ingest met [--department-ids ID,ID,…]` → `services/ml/ml/ingest/met_db.py`. CLI produces records conforming to canonical `NormalizedArtwork` schema; `artworks` table is ready to be populated. Decision: D-018.
 
+### 2026-05-10 — `/v1/identify` exception handling split (ml-retrieval-engineer fix)
+
+**Context:** ml-retrieval-engineer fixed a transformers 5.x incompatibility in the embedding pipeline. As part of the fix, split the broad `except Exception` in `/v1/identify` route into two distinct catches:
+
+- PIL decode failure → 400 `bad_request` "Image could not be decoded"
+- Model inference failure → 500 `internal_error` "Embedding failed."
+
+**Impact:** Embedding failures are now properly surfaced (previously hidden as 400s), aiding debugging and observability.
+
+**Ready for iOS:** The `/v1/identify` endpoint is now end-to-end live and returning real Met candidates with confidence-aware status. iOS team can proceed with the app flip.
+
 ### Working rules
 
 - Conform to `docs/api.md`, `docs/deployment.md`, `docs/privacy-observability.md` for changes.
