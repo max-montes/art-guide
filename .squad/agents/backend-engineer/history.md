@@ -56,3 +56,38 @@
 - created: `.squad/skills/grounded-llm-prompt/SKILL.md`
 - modified: `services/api/app/db.py` (`nearest_neighbors` body + `_vector_literal`), `app/config.py` (4 thresholds), `app/main.py` (warm_embedder), `app/routes/identify.py` (full pipeline)
 - modified: `services/api/pyproject.toml`, `tests/conftest.py`, `.env.example`, `README.md`
+
+## Learnings
+
+### 2026-05-10 — venv-first install pattern + the SigLIP/torch footgun
+
+**The footgun.** `pip install -e ../ml` from the API directory pulls SigLIP's runtime: `torch>=2.2`, `transformers`, `sentencepiece`, `pillow-heif`. If a contributor runs that without a venv active, pip cheerfully upgrades torch *globally*. Anything else on their machine pinned to an older torch silently breaks. The canonical example is `pyannote-audio`, which pins `torch==2.1.2`/`torchaudio==2.1.2`/`torchvision==0.16.2`. max-montes hit exactly this.
+
+**Recovery for an already-trashed pyannote-audio env** (run *outside* the art-guide venv): `pip install 'torch==2.1.2' 'torchaudio==2.1.2' 'torchvision==0.16.2'`.
+
+**Prevention.** `services/api/.venv-bootstrap.sh` is the single supported install path now. It:
+
+- bails if Python < 3.11 (matches `services/api/pyproject.toml::requires-python`),
+- creates `services/api/.venv` if missing (else reuses it — idempotent),
+- activates it, sanity-checks `command -v python` resolves into the venv before doing anything else,
+- fast-skips the pip installs if `import app.main, ml.imageops` already succeeds,
+- installs `-e ../ml` *first* (the heavy one, so torch resolves once), then `-e .[dev]`,
+- prints the next-step `source .venv/bin/activate && AUTO_MIGRATE=true uvicorn app.main:app --reload`.
+
+`set -euo pipefail` and `cd "$(dirname "$0")"` so it's safe to run from anywhere.
+
+**README is now venv-first.** Quick Start step 2 is `./.venv-bootstrap.sh`. There's a "Why a venv?" callout right under it explaining the torch upgrade gotcha so future contributors don't have to rediscover it. The Configuration section's local-dev block also points at the bootstrap, and the Tests section assumes the bootstrap-created venv (no more `pip install -e ".[dev]"` outside a venv).
+
+**Why a script and not poetry/uv/hatch.** Project style is "keep it boring": stdlib `venv` + `pip`. Adding a packaging tool just to fix an ergonomics hole would be a bigger commitment (lockfiles, CI changes, contributor onboarding) than the problem warrants. A 60-line bash script is the smallest reversible change that makes the right thing the easy thing. If we ever need cross-package version pinning (lockfile-style), that's the moment to revisit `uv` — not this.
+
+**`.gitignore` was already good.** Root `.gitignore` has `**/.venv/`, so `services/api/.venv/` was already covered. No change needed.
+
+**Files added/modified**
+
+- created: `services/api/.venv-bootstrap.sh` (chmod +x)
+- created: `.squad/skills/python-venv-isolation/SKILL.md`
+- modified: `services/api/README.md` (Quick start, Why a venv?, Configuration block, Tests block)
+
+## Cross-Agent Note
+
+**2026-05-11 — ml-retrieval-engineer fixed SigLIP embedder + Met HTTP 406 bugs.** The cached embedder in FastAPI lifespan should now warm cleanly without crashing on first request. Met ingest pipeline is now fully executable.

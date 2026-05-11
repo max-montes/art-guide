@@ -115,3 +115,9 @@ iOS readiness: scaffold complete, awaiting project owner Xcode setup.
 ### 2026-05-11 — Backend `/v1/identify` live, ready to flip to APIClient
 
 Backend /v1/identify is now wired and ready; flip iOS to live mode (APIClient + Config.xcconfig http://localhost:8000) to test end-to-end.
+
+---
+
+### 2026-05-11 — Ingestion pipeline now fully executable
+
+ml-retrieval-engineer fixed SigLIP embedder `.pooler_output` crash and Met HTTP 406 errors. Met Museum corpus can now be ingested end-to-end. Backend embedder cache should warm cleanly at startup. No iOS code changes needed; update backend URL to `http://localhost:8000` when ready to test live.
