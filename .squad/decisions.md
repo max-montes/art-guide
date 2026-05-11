@@ -110,6 +110,49 @@
 **Unblocks:** Backend can now finalize `artworks.embedding: vector(768)` schema. Backend calls `get_embedder().embed_bytes(image_bytes)` for /v1/identify. ML Engineer proceeds to Met-ingest + retrieval-v1 eval dataset bootstrap.
 **Owner:** ml-retrieval-engineer. **Status:** Active.
 
+## D-016 — Postgres schema + migration runner
+**Decision:** The art-guide Postgres schema is established by **plain SQL files** under `services/api/app/migrations/`, applied by an asyncpg-backed runner in `services/api/app/migrations/__init__.py`. The initial migration `0001_init.sql` creates the `pgvector` extension and the canonical `artworks` table with `vector(768)` for SigLIP embeddings, HNSW cosine index, and idempotent `UNIQUE(source, source_id)` conflict target for upserts.
+
+### Migration tool: plain SQL, not Alembic (for now)
+1. Single initial migration; Alembic overhead without current value.
+2. API service uses asyncpg only — no SQLAlchemy ORM. No need to drag SQLAlchemy in as a dependency.
+3. Runner is ~100 lines, transparent: developers can read it once and know exactly what runs at startup.
+4. Exit door: when migrations multiply, swap this module for Alembic in a single follow-up migration.
+
+### Vector dimension locked to `embedding vector(768)` (SigLIP)
+Per D-015, embedder is `google/siglip-base-patch16-224`. If the default embedder swaps, write a **new** migration (`0002_*.sql`) that ALTERs the embedding column at the new dimension and rebuilds the HNSW index; do **not** edit `0001_init.sql`.
+
+### Index strategy
+- HNSW over `vector_cosine_ops` per D-003 / D-005 (cosine similarity, vectors L2-normalized at embedder boundary).
+- Build params `m = 16, ef_construction = 64` — Phase-1 defaults for ~50K Met catalog.
+- Btree on `source` for source-scoped filtering.
+
+### Idempotency contract
+`artworks` carries `id text PRIMARY KEY` (namespaced e.g. `met:436532`), `source text NOT NULL`, `source_id text NOT NULL`, with `UNIQUE(source, source_id)`. Ingestion adapters UPSERT against `(source, source_id)` to avoid duplicates on re-ingest; both keys point at the same row by construction.
+
+### Schema columns
+Aligned with `services/ml/ml/schema.py::NormalizedArtwork` and `docs/data-model.md`: `id`, `source`, `source_id`, `title`, `artist`, `date` (text, free-form), `medium`, `culture`, `period`, `museum`, `source_url`, `image_url` (museum-hosted URL only, never bytes per D-012), `tags` (text[]), `is_public_domain`, `raw_metadata` (jsonb safety valve), `embedding` (vector(768)), `created_at`, `updated_at` (maintained by trigger `art_guide_set_updated_at`). Fields from the original task brief not in `NormalizedArtwork` (e.g., `artist_name`, `date_start`, `dimensions`, `current_location`) were intentionally omitted; source-specific extras live in `raw_metadata` without schema churn.
+
+### `AUTO_MIGRATE` behavior
+New setting: `Settings.AUTO_MIGRATE: bool = False`. The FastAPI lifespan opens the asyncpg pool, then if `AUTO_MIGRATE=true` and the pool came up, calls `apply_migrations(get_pool())`. Errors are logged, never raised. Default is **False everywhere** (including `local`); local devs opt in via `AUTO_MIGRATE=true` in `.env`. Prod never enables it; migrations are a deliberate `python -m app.migrations` step in the deploy pipeline.
+
+### Operational interface
+- `python -m app.migrations` — apply pending migrations; prints `applied N migration(s): ...` or `no pending migrations`.
+- `await app.migrations.apply_migrations(pool)` — programmatic API.
+- `app.migrations.discover_migrations(directory=None)` — returns apply-ordered list.
+- `schema_migrations(version text PK, applied_at timestamptz DEFAULT now())` records every successful apply.
+
+### What this unblocks
+- ml-retrieval-engineer can wire ingest to UPSERT into `artworks` with 768-dim embeddings.
+- Query path can issue `ORDER BY embedding <=> $1 LIMIT k` against HNSW.
+- `app.db.ArtworkRepository` skeleton gives callers a stable surface; bodies land when ingest/retrieval lands.
+
+### Constraint conformance
+D-003 (single FastAPI service), D-005 (cosine distance, top-K rule at query time), D-007 (API shape), D-012 (no raw image bytes).
+
+**References:** D-003, D-005, D-007, D-011, D-012, D-015.
+**Owner:** backend-engineer. **Status:** Active.
+
 ## Governance
 
 - All meaningful changes require explicit decisions here.
