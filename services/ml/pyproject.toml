@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "art-guide-ml"
+version = "0.1.0"
+description = "Ingestion, retrieval, and evaluation scaffolding for the art-guide ML service."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "art-guide team" }]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.6",
+    "tqdm>=4.66",
+    "pillow>=10.2",
+    "pillow-heif>=0.16",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "torch>=2.2",
+    "transformers>=4.40",
+    "sentencepiece>=0.2",
+    "asyncpg>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+art-guide-ml = "ml.cli:main"
+
+[tool.setuptools]
+# Keep both the runtime package (`ml`) and the eval harnesses installable.
+packages = [
+    "ml",
+    "ml.ingest",
+    "ml.eval_data",
+    "evals",
+    "evals.evaluators",
+    "eval",
+]

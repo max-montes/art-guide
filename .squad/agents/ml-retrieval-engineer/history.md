@@ -79,6 +79,37 @@ AUTO_MIGRATE=true art-guide-ml ingest met --limit 100 --department-ids 11
 
 **All three fixed by:** Writing a test that exercises the exact production code path (not a mock around it). This skill is now **high-confidence**; it's proven its value and is a repeatable pattern for all future work.
 
+### 2026-05-10 — Eval bootstrap shipped (Phase 1 close-out)
+
+**What shipped:**
+- `services/ml/eval/dataset.jsonl` — 45 test cases (30 exact in-catalog, 5 perturbed, 10 out-of-catalog)
+- `services/ml/eval/run_eval.py` — full eval harness: download, perturbation, POST to `/v1/identify`, compute recall@1/3, status_accuracy, latency p50/p95/p99, write JSON+Markdown report, exit non-zero on threshold breach
+- `services/ml/eval/thresholds.yaml` — gating thresholds (permissive bootstrap: recall@1≥0.80, recall@3≥0.90, status_accuracy≥0.65, p99≤5000ms)
+- `services/ml/eval/README.md` — how to run, interpret, add cases
+- `services/ml/tests/test_eval_harness.py` — 31 unit tests (all HTTP mocked); all pass
+- `art-guide-ml eval` CLI subcommand (`ml/cli.py`)
+- `docs/eval-ci.md` — GitHub Actions CI sketch (Phase 2 Azure Foundry integration out of scope per D-013)
+- `services/ml/eval/baseline-2026-05-11T06-30-17Z.json` — baseline snapshot
+
+**Baseline (100-record catalog, 35 in-catalog cases):**
+
+| Metric | Value |
+|--------|-------|
+| recall@1 | **1.000** |
+| recall@3 | **1.000** |
+| status_accuracy | **1.000** |
+| latency_p50_ms | 841 ms |
+| latency_p95_ms | 1328 ms |
+| latency_p99_ms | 1385 ms |
+
+All 30 exact cases: confidence=1.000, `status=exact`. All 5 perturbed: `status=exact`, confidence 0.941–0.999.
+
+**Rate-limit gotcha learned:** Local API enforces 10 req/5 min keyed on IP. `--request-delay-s 35` gives ≈8.5 req/5 min (safe). HEAD requests to check `X-RateLimit-Remaining` also consume slots — don't use them. In CI: set `RATE_LIMIT_REQUESTS=200 RATE_LIMIT_WINDOW_SECONDS=60` server-side.
+
+**Skill extracted:** `.squad/skills/eval-harness-for-grounded-retrieval/SKILL.md` (low confidence, single observation): three-class test set is necessary for calibrated confidence-enum coverage.
+
+---
+
 ### 2026-05-11 — Fourth "exercise-the-real-path" bug win: iOS Codable shape mismatch in `/v1/identify` response
 
 **Cross-agent:** ios-engineer-2 flipped the app to live-mode against the backend server (running at `http://localhost:8000`) and immediately hit a decode failure. Root cause: the Swift Codable model expected a flat response shape but the server sends a nested `match` envelope. Additionally, per-candidate similarity is named `score` in the wire format but `confidence` in Swift's CodingKey.

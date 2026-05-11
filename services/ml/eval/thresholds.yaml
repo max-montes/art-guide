@@ -1,0 +1,25 @@
+# Gating thresholds for the art-guide retrieval eval harness.
+# All metrics must meet or exceed their threshold for the eval to exit 0.
+# These are deliberately permissive at bootstrap; tighten as the catalog grows.
+#
+# Applies to: services/ml/eval/run_eval.py
+# Rationale: services/ml/eval/README.md § "Threshold rationale"
+
+# Fraction of in-catalog (exact + perturbed) cases where the top-1 returned
+# candidate matches the expected_artwork_id.
+# 0.85 with a 100-record catalog; relax to 0.80 while dataset covers all 100.
+recall_at_1: 0.80
+
+# Fraction of in-catalog cases where expected_artwork_id appears in the top-3
+# returned candidates (k=5 is retrieved; we check the first 3).
+recall_at_3: 0.90
+
+# Fraction of ALL cases (including out_of_catalog) where the returned
+# match.status equals the expected_status field in the dataset.
+# Out-of-catalog expected values are best-guess; allow some misclassification.
+status_accuracy: 0.65
+
+# p99 total wall-clock latency in milliseconds (download + embed + retrieve).
+# 5000 ms is generous for local dev; tighten once we baseline Azure latency.
+# Note: this includes image download time; subtract that for pure API latency.
+latency_p99_ms: 5000

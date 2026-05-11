@@ -323,3 +323,17 @@ Plus retrieval/filtering:
 
 **Owner:** ml-retrieval-engineer. **Status:** Tier (a) ready to implement; recommendation is ship in Phase 1. **Date:** 2026-05-10.
 **Audit file:** `docs/met-ingest-field-audit.md`.
+
+## D-025 — Eval bootstrap: dataset design, thresholds, baseline
+
+**Decision:** Ship a held-out eval harness as Phase 1 close-out before any Phase 2 changes land (embedder swap, Azure deploy, Wikipedia adapter). Without a repeatable before/after number, every change is flying blind.
+
+**Dataset (45 cases):** 30 exact in-catalog (exact Met CDN source images; should score cosine ≈ 1.0 → `exact`), 5 perturbed in-catalog (PIL transforms: rotate 5°, crop 10%, brightness ×1.2, contrast ×0.8, saturation ×0.9; still expected `exact`), 10 out-of-catalog (famous paintings not in catalog + non-art photos; expected `style_only`/`no_match`). Three-class design is necessary: class (a) catches recall regression, class (b) catches robustness regression, class (c) catches false-positive/over-confidence regression.
+
+**Thresholds (bootstrap/permissive):** recall@1 ≥ 0.80, recall@3 ≥ 0.90, status_accuracy ≥ 0.65, latency_p99_ms ≤ 5000. Tighten after catalog grows to 10K+ and Azure baseline is measured.
+
+**CI form (v1):** GitHub Actions sketch in `docs/eval-ci.md`. Azure AI Foundry integration is Phase 2 per D-013 — not blocked on it.
+
+**Baseline (100-record catalog, 2026-05-10):** recall@1=1.000, recall@3=1.000, status_accuracy=1.000, p50=841ms, p99=1385ms. Snapshot: `services/ml/eval/baseline-2026-05-11T06-30-17Z.json`.
+
+**Owner:** ml-retrieval-engineer. **Date:** 2026-05-10.
