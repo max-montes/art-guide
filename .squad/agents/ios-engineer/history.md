@@ -165,3 +165,23 @@ silently break local dev" (ATS, Codable mismatch, xcconfig propagation).
 
 **Impact for iOS:** The app's error-handling code can now assume all HTTP 4xx responses are properly formatted API errors (never internal server failures mis-reported as 4xx). Simplifies retry logic and user messaging.
 
+
+## 2026-05-11 — Eval bootstrap shipped; explanation UX now gated by eval thresholds
+
+**ml-retrieval-engineer-5 closed Phase 1** by shipping an eval harness (45 test cases, 31 unit tests, thresholds, baseline). Result: **eval is now the gate** — any future change to the app's explanation UX (D-026: museum plaque prose, always-invoke LLM) must satisfy eval thresholds to ensure confidence bands behave as designed.
+
+**Implication for you:** Your explanation UI work (plaque prose rendering, confidence-aware hedging) should now validate against the eval harness to confirm that the backend's status enum + confidence scores are correctly displayed (e.g., `exact` always shows plain prose, `style_only` hedges with "resembles", `no_match` shows re-shoot prompt). Before shipping explanation UX changes, coordinate with ml-retrieval-engineer and verify the eval still passes.
+
+**Key baseline metrics (100-record catalog, 2026-05-10):**
+- recall@1 = 1.000 (exact matches always found)
+- recall@3 = 1.000 (top-3 safe for `likely` ambiguous cases)
+- status_accuracy = 1.000 (confidence bands applied correctly)
+- latency_p99_ms = 1385 (fast enough for interactive app)
+
+**D-026 decision (now locked):** Explanation UX is always prose paragraph (never bulleted list), always invokes LLM (every confidence band, including `no_match`), always grounded in retrieved fields only. This confirms the LLM is non-optional and justifies its presence in the architecture.
+
+**Files to know:**
+- `services/ml/eval/run_eval.py` — how to verify your changes don't regress eval
+- `services/ml/eval/dataset.jsonl` — test cases (use for manual spot checks of edge cases)
+- `services/ml/eval/baseline-2026-05-11T06-30-17Z.json` — baseline snapshot
+- D-025 + D-026 in decisions.md — eval design & explanation UX decision

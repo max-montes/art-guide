@@ -337,3 +337,45 @@ Plus retrieval/filtering:
 **Baseline (100-record catalog, 2026-05-10):** recall@1=1.000, recall@3=1.000, status_accuracy=1.000, p50=841ms, p99=1385ms. Snapshot: `services/ml/eval/baseline-2026-05-11T06-30-17Z.json`.
 
 **Owner:** ml-retrieval-engineer. **Date:** 2026-05-10.
+
+## D-026 — Tier (a) museum-plaque enrichment: API response shape
+
+**Decision:** Extend `Candidate` (wire type) with 7 new nullable fields from D-024 tier (a). Four are LLM-groundable (appear in `grounded_fields`); three are retrieval/forward-compat only (never in `grounded_fields`).
+
+**LLM-groundable (added to `_GROUNDABLE_FIELDS` in `app/llm.py`):**
+- `artist_bio` — short bio note from Met `artistDisplayBio`
+- `credit_line` — provenance/acquisition context
+- `dimensions` — physical dimensions
+- `dynasty` — dynasty classification
+
+**Retrieval/forward-compat only (NOT in `grounded_fields`):**
+- `object_wikidata_url` — Wikidata bridge for tier (b) Phase 2
+- `date_begin` / `date_end` — integer year bounds for temporal filtering
+
+**Changes:**
+- `services/api/app/schemas.py`: `Candidate` + `GroundedField` extended.
+- `services/api/app/db.py`: `ArtworkRepository.nearest_neighbors` SQL SELECT includes new columns.
+- `services/api/app/llm.py`: `_GROUNDABLE_FIELDS` extended with 4 prose-groundable fields.
+- `services/api/app/routes/identify.py`: `_row_to_candidate` maps new fields.
+- `packages/shared/api/identify-response.schema.json`: `Candidate` def + `grounded_fields` enum extended.
+- `docs/api.md`: Candidate table and grounded_fields description updated.
+- 3 new tests (73 total passing): populated fields present, absent fields null, grounded_fields contains new four.
+
+**Constraint conformance:** D-002 (retrieval-first), D-005 (grounding), D-007 (additive API), D-024 (tier a scope).
+
+**Owner:** backend-engineer. **Date:** 2026-05-10.
+
+## D-026 — Explanation UX: Museum plaque prose (not list)
+
+**Decision:** Explanation rendering is always prose paragraph (single text block), never a bulleted list. The LLM must invoke on every request regardless of confidence band, always grounded in retrieved record fields only per Hard Rule #1. The interaction model is "museum wall plaque" — cohesive narrative that stitches metadata (title, artist, period, medium, dimensions, provenance) into a single sentence or paragraph.
+
+**Rationale:** Product feel. Lists feel sterile and fragmented; a plaque metaphor elevates the experience and justifies LLM presence. Confirms LLM is non-optional (can't drop it to save cost) but does not relax grounding — every fact must originate from the retrieved record, no world knowledge injection.
+
+**iOS impact:** No rendering of bullet-list properties. Explanation is single paragraph in the results view. Server sends one `explanation` string; client displays it as-is (no client-side formatting).
+
+**Backend implementation:** `build_prompt(record, status)` always generates for every confidence band, including `no_match` (previously canned text). Grounding contract unchanged: LLM failure is non-fatal (logged, replaced with deterministic stub). Prompt template includes status-specific guardrails (exact: "plainly", likely: "hedge", style_only: "resembles only").
+
+**Constraint conformance:** Hard Rule #1 (LLM does not own facts), D-002 (retrieval-first).
+
+**Owner:** Coordinator + backend-engineer + ios-engineer. **Status:** Design locked. **Date:** 2026-05-11.
+

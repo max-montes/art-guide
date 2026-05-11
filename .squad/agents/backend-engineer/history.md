@@ -128,3 +128,29 @@ All 70 tests pass. Live server verified: `curl -F "image=string" http://localhos
 **2026-05-11 — ml-retrieval-engineer fixed SigLIP embedder + Met HTTP 406 bugs.** The cached embedder in FastAPI lifespan should now warm cleanly without crashing on first request. Met ingest pipeline is now fully executable.
 
 **2026-05-11 — iOS live-mode wiring reconciled the JSON contract with Swift Codable models.** ios-engineer-2 discovered that the nested `match` envelope in the server's `/v1/identify` response (`{ request_id, match: { status, candidates }, explanation }`) was misaligned with the iOS Swift model's flat shape expectation. Additionally, per-candidate similarity is named `score` in `docs/api.md` but `confidence` in the Swift CodingKey. Fixes: reshaped `IdentifyResponse` with `MatchEnvelope` struct (mirrors server shape, computed properties preserve call sites), added `case confidence = "score"` CodingKey, added `NSAllowsLocalNetworking = true` to Info.plist (unblock HTTP localhost). Debug diagnostics also added: launch-time URL print, full DecodingError logging. This confirms the response shape `{ request_id, match: { status, confidence, candidates }, explanation, diagnostics }` is now canonical and exercised end-to-end by real client. Decision D-022.
+
+## 2026-05-11 — Eval bootstrap shipped; becomes gate for all API changes
+
+**ml-retrieval-engineer-5 closed Phase 1** by shipping an eval harness (45 test cases, 31 unit tests, thresholds, baseline). Result: **eval is now the gate** — any future backend change (embedder swap, confidence threshold tweak, schema migration, Azure deploy, catalog expansion) must satisfy baseline thresholds before landing.
+
+**Implication for you:** Before committing any API-side change in Phase 2+, run `services/ml/eval/run_eval.py` locally (or in CI) to verify the change doesn't regress recall@1, recall@3, status_accuracy, or latency_p99. Baseline snapshot: `services/ml/eval/baseline-2026-05-11T06-30-17Z.json` (recall@1=1.0, recall@3=1.0, status_accuracy=1.0, p99=1385ms).
+
+**Baseline thresholds (permissive for v1):**
+- recall@1 ≥ 0.80
+- recall@3 ≥ 0.90
+- status_accuracy ≥ 0.65
+- latency_p99_ms ≤ 5000
+
+**Tightening roadmap:**
+- After catalog grows to 10K+: raise `status_accuracy` to 0.80.
+- After Azure West US 3 deploy: tighten `latency_p99_ms` to 2000.
+- On embedder swap: re-run baseline first, then set thresholds at `baseline − 5%`.
+
+**Files to know:**
+- `services/ml/eval/run_eval.py` — harness entry point
+- `services/ml/eval/thresholds.yaml` — gating thresholds
+- `services/ml/eval/dataset.jsonl` — 45 test cases
+- `docs/eval-ci.md` — CI sketch (Foundry integration Phase 2)
+- D-025 in decisions.md — design rationale
+
+**Rate limit note:** Local rate limit is 10 req/5 min. Use `--request-delay-s 35` when running eval locally. In CI, set `RATE_LIMIT_REQUESTS=200 RATE_LIMIT_WINDOW_SECONDS=60`.
