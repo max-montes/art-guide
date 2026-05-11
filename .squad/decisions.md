@@ -338,6 +338,34 @@ Plus retrieval/filtering:
 
 **Owner:** ml-retrieval-engineer. **Date:** 2026-05-10.
 
+## D-026 — iOS result-view UX: museum source link + debug-prefix stripping
+
+**Decision:** Two changes to the iOS result presentation layer.
+
+### Fix 1 — "View on {museum}" source link
+`source_url` from the API response is the canonical "more info" path for v1. Instead of scraping or duplicating museum content, the app sends users to the source. A new `MuseumSourceRow` component renders below the explanation block in `ExactMatchView`, `LikelyMatchView`, and `StyleOnlyView` whenever the top candidate carries a `sourceURL`. Label is museum-name-aware: "View on {museum}" using the `museum` field, falling back to "View on Museum" if absent. A caption line "Source: {museum}" makes the data provenance explicit. Tap opens the URL via `UIApplication.shared.open`. The pre-existing subtle "View source" link in `ArtworkCard.full` is removed to avoid duplication.
+
+### Fix 2 — Debug-prefix stripping (client-side, defensive)
+The backend may emit `[LLM call skipped -- AZURE_OPENAI not configured]` as a prefix on `explanation.text` when Azure OpenAI is not configured. `Explanation.displayText` strips any leading `[…]` bracket using a regex before the text reaches the UI. `ExplanationBlock` and `NoMatchView` now use `displayText` instead of `text`. Client-side stripping is defensive — it stays correct even after the backend removes the source prefix. **Backend should also clean the source**: the debug bracket must not be emitted in the JSON response at all; this is a follow-up for backend-engineer.
+
+### Museum-plaque field rendering — deferred (D-024 Wave 2)
+New fields from D-024 tier (a) (`artist_bio`, `credit_line`, `dimensions`, `dynasty`) will land in the backend response. iOS must **not** render them as a bulleted list. They will be woven into LLM-generated plaque prose in Wave 2. `ArtworkCandidate` uses synthesized `Codable` with explicit `CodingKeys`; Swift silently ignores unknown JSON keys, so no decoder changes are needed. A regression test (`ArtworkCandidateTests.test_unknownFields_areIgnored`) guards this. When Wave 2 lands, remove the TODO and update `ExplanationBlock` to render the richer prose — do not add individual field rows.
+
+**Files changed:**
+- `Apps/ios/ArtGuide/Models/Explanation.swift` — added `displayText` computed property
+- `Apps/ios/ArtGuide/Views/Components/MuseumSourceRow.swift` — new component
+- `Apps/ios/ArtGuide/Views/Components/ArtworkCard.swift` — removed inline "View source" link
+- `Apps/ios/ArtGuide/Views/Status/ExactMatchView.swift` — `displayText` + `MuseumSourceRow`
+- `Apps/ios/ArtGuide/Views/Status/LikelyMatchView.swift` — `MuseumSourceRow`
+- `Apps/ios/ArtGuide/Views/Status/StyleOnlyView.swift` — `MuseumSourceRow`
+- `Apps/ios/ArtGuide/Views/ResultView.swift` — `displayText` for `NoMatchView`
+- `Apps/ios/project.yml` — `ArtGuideTests` unit-test target + scheme wiring
+- `Apps/ios/ArtGuideTests/ExplanationTests.swift` — 8 unit tests for `displayText`
+- `Apps/ios/ArtGuideTests/ArtworkCandidateTests.swift` — 5 decoding tests
+
+**Constraint conformance:** D-007 (API shape), D-024 (museum-plaque deferred), hard rule #1 (LLM does not own facts).
+**Owner:** ios-engineer. **Status:** Active. **Date:** 2026-05-10.
+
 ## D-026 — Tier (a) museum-plaque enrichment: API response shape
 
 **Decision:** Extend `Candidate` (wire type) with 7 new nullable fields from D-024 tier (a). Four are LLM-groundable (appear in `grounded_fields`); three are retrieval/forward-compat only (never in `grounded_fields`).
@@ -379,3 +407,32 @@ Plus retrieval/filtering:
 
 **Owner:** Coordinator + backend-engineer + ios-engineer. **Status:** Design locked. **Date:** 2026-05-11.
 
+
+
+## D-027 — Met Enrichment Tier (a) — Shipped
+
+**Decision:** D-024 tier (a) implementation complete. Seven new columns backfilled across all 100 existing Met records. `dynasty` is 0% populated in the current European Paintings corpus (department 11) — expected; it will populate when Egyptian/ancient Asian records are ingested in Phase 4.
+
+**What shipped:**
+- `services/api/app/migrations/0002_met_enrichment.sql` — idempotent `ADD COLUMN IF NOT EXISTS` for 7 nullable columns + date-range btree index.
+- `services/ml/ml/schema.py` — `NormalizedArtwork` gains 7 new `Optional` fields with doc-strings.
+- `services/ml/ml/ingest/met_db.py` — `map_met_record` extracts all 7 fields; empty strings normalized to `None`; `_INSERT_SQL` and `_commit_batch` extended.
+- `services/ml/ml/ingest/met_backfill.py` — `backfill_met_enrichment(pool, …)` + pure `extract_enrichment_fields(raw)`. Updates 7 enrichment columns only; preserves embeddings.
+- `services/ml/ml/cli.py` — `art-guide-ml backfill met` subcommand.
+- `services/ml/tests/test_met_db_ingest.py` — 10 new unit tests; all 41 tests passing.
+
+**Backfill outcome (2026-05-10, 100 rows):**
+
+| Field | Populated |
+|---|---|
+| `artist_bio` | 100 / 100 |
+| `credit_line` | 100 / 100 |
+| `dimensions` | 100 / 100 |
+| `dynasty` | 0 / 100 (European Paintings — no dynasty data) |
+| `object_wikidata_url` | 100 / 100 |
+| `date_begin` | 100 / 100 |
+| `date_end` | 100 / 100 |
+
+**Constraint conformance:** D-002, D-005, D-007, D-024.
+
+**Owner:** ml-retrieval-engineer. **Date:** 2026-05-10.

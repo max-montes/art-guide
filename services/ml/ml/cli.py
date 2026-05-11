@@ -25,6 +25,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from ml.ingest.met import MetIngestionAdapter
+from ml.ingest.met_db import DEFAULT_REQUEST_DELAY_S
 from ml.schema import NormalizedArtwork
 
 logger = logging.getLogger("ml.cli")
@@ -152,6 +153,49 @@ def _scrub_dsn(dsn: str) -> str:
     return f"{scheme}://{creds}@{host}"
 
 
+# -------------------------------------------------------------------- backfill
+
+async def _run_backfill_met(args: argparse.Namespace) -> int:
+    """Re-fetch Met JSON for existing rows, UPDATE enrichment columns only."""
+    import asyncpg
+
+    from ml.ingest.met_backfill import backfill_met_enrichment
+
+    dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
+    logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
+    try:
+        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"Could not open Postgres pool ({exc!s}). "
+            "Bring up infra/docker-compose.yml first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        stats = await backfill_met_enrichment(
+            pool=pool,
+            request_delay=args.request_delay,
+        )
+    finally:
+        await pool.close()
+
+    summary = stats.as_dict()
+    print(
+        f"[BACKFILL] Met enrichment done: "
+        f"total_rows={summary['total_rows']}, "
+        f"fetched={summary['fetched']}, "
+        f"updated={summary['updated']}, "
+        f"skipped={summary['skipped_fetch_error']}"
+    )
+    return 0
+
+
+def _cmd_backfill_met(args: argparse.Namespace) -> int:
+    return asyncio.run(_run_backfill_met(args))
+
+
 # -------------------------------------------------------------------- augment
 
 def _cmd_augment(args: argparse.Namespace) -> int:
@@ -228,7 +272,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python -m ml.cli",
         description="art-guide ML utilities: ingestion + eval data augmentation.",
     )
-    sub = parser.add_subparsers(dest="command", metavar="{ingest,augment,embed,eval}")
+    sub = parser.add_subparsers(dest="command", metavar="{ingest,backfill,augment,embed,eval}")
 
     # ingest
     ingest = sub.add_parser("ingest", help="Run an ingestion adapter.")
@@ -291,7 +335,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     met.set_defaults(func=_cmd_ingest_met)
 
-    # augment
+    # backfill
+    backfill = sub.add_parser(
+        "backfill",
+        help="Backfill enrichment fields without re-embedding.",
+    )
+    backfill_sub = backfill.add_subparsers(dest="source", metavar="{met}")
+
+    backfill_met = backfill_sub.add_parser(
+        "met",
+        help=(
+            "Re-fetch Met API JSON for existing rows and UPDATE the seven "
+            "D-024 enrichment columns (artist_bio, credit_line, dimensions, "
+            "dynasty, object_wikidata_url, date_begin, date_end). "
+            "Embeddings are preserved. Idempotent."
+        ),
+    )
+    backfill_met.add_argument(
+        "--database-url",
+        default=None,
+        help="Postgres DSN (default: $DATABASE_URL or local docker-compose stack).",
+    )
+    backfill_met.add_argument(
+        "--request-delay",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY_S,
+        help=f"Seconds between Met API requests (default: {DEFAULT_REQUEST_DELAY_S}).",
+    )
+    backfill_met.set_defaults(func=_cmd_backfill_met)
     aug = sub.add_parser(
         "augment", help="Generate augmented variants of a reference artwork image."
     )

@@ -120,3 +120,19 @@ The confidence model for the "exercise-the-real-path" skill is now **very high**
 
 **Decision D-022** documents the full fix.
 
+
+### 2026-05-10 — D-024 Tier (a) Met Enrichment Shipped
+
+**What shipped:**
+- Migration `0002_met_enrichment.sql`: 7 nullable columns (`artist_bio`, `credit_line`, `dimensions`, `dynasty`, `object_wikidata_url`, `date_begin`, `date_end`) added with `ADD COLUMN IF NOT EXISTS`. Idempotent. Btree index on `(date_begin, date_end)` for temporal filtering.
+- `NormalizedArtwork` in `schema.py`: 7 new `Optional` fields with doc-strings split into grounded (4) and retrieval-only (3).
+- `met_db.py`: `map_met_record` extracts all 7 fields; empty strings → `None`. `_INSERT_SQL` grows to $23 bindings. `_commit_batch` passes all 7.
+- `met_backfill.py` (new): `backfill_met_enrichment(pool, …)` fetches Met API for each existing row and UPDATEs only the 7 enrichment columns — preserves embeddings. `extract_enrichment_fields(raw)` is the pure extraction helper. Idempotent.
+- `cli.py`: `art-guide-ml backfill met` subcommand wired.
+- 10 new tests in `test_met_db_ingest.py`; all 41 tests passing.
+
+**Backfill outcome:** 100/100 rows updated. `dynasty` is 0% populated across the European Paintings corpus — expected; it only appears for Egyptian/ancient Asian art (Phase 4).
+
+**Learnings:**
+- **Empty-string normalization is essential for Met data.** `objectBeginDate=0` and `dynasty=""` are the Met's way of saying "absent"; the ingest layer must normalize both to `None` or downstream queries see misleading zeroes.
+- **Backfill-not-re-embed is the right pattern for metadata-only updates.** Re-ingesting 100 records to backfill 7 text fields would waste ~10 minutes of embed time and discard valid embedding vectors. The `backfill_met_enrichment` pattern (fetch JSON, UPDATE columns only) is repeatable for every future field addition.
