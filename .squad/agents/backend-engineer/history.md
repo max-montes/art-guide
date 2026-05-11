@@ -4,6 +4,30 @@
 
 ## Current Status
 
+### 2026-05-10 — `_validation_handler` JSON serialization fix
+
+**Bug:** `POST /v1/identify` with a string where `UploadFile` was expected caused `RequestValidationError`. The handler passed `exc.errors()` directly to `JSONResponse`. Pydantic v2 error dicts include a `ctx.error` field containing the raw `ValueError` object, which `json.dumps` cannot serialize → 500 `TypeError`.
+
+**Fix (`app/main.py`):**
+- Added `_sanitize_validation_errors()` — walks Pydantic error dicts, replaces any `Exception` in `ctx` with `str(exc)` (not `repr`, so class name is not exposed).
+- Added `_validation_summary()` — builds a human-readable `"field: message"` line from the first error's `loc` + `msg`, stripping Pydantic's `"Value error, "` prefix.
+- `_validation_handler` now sanitizes before calling `error_response`.
+- Audited `_http_handler` and `_unhandled_handler` — both safe (only pass literal strings).
+
+**Regression tests (`tests/test_validation_handler.py`, 4 tests):**
+- string-where-file-expected → clean 400 JSON conforming to API error contract
+- missing required field → clean 400 JSON
+- `ctx` values are JSON primitives (not Exception objects)
+- error message doesn't expose exception class names
+
+**Decision log:** `.squad/decisions/inbox/backend-engineer-validation-handler-fix.md`
+
+All 70 tests pass. Live server verified: `curl -F "image=string" http://localhost:8000/v1/identify` returns clean 400 JSON.
+
+---
+
+
+
 **Phase 1 core path operational:** `/v1/identify` end-to-end pipeline wired (embed → retrieve → LLM → format). Postgres+pgvector schema in place, migrations runnable, embedder cache pattern baked in, LLM guardrails guard-railed. 65 tests passing. Met ingest pipeline (ml-retrieval-engineer) now wired — artworks table ready to populate (D-018).
 
 ### What's next
@@ -102,3 +126,5 @@
 ## Cross-Agent Note
 
 **2026-05-11 — ml-retrieval-engineer fixed SigLIP embedder + Met HTTP 406 bugs.** The cached embedder in FastAPI lifespan should now warm cleanly without crashing on first request. Met ingest pipeline is now fully executable.
+
+**2026-05-11 — iOS live-mode wiring reconciled the JSON contract with Swift Codable models.** ios-engineer-2 discovered that the nested `match` envelope in the server's `/v1/identify` response (`{ request_id, match: { status, candidates }, explanation }`) was misaligned with the iOS Swift model's flat shape expectation. Additionally, per-candidate similarity is named `score` in `docs/api.md` but `confidence` in the Swift CodingKey. Fixes: reshaped `IdentifyResponse` with `MatchEnvelope` struct (mirrors server shape, computed properties preserve call sites), added `case confidence = "score"` CodingKey, added `NSAllowsLocalNetworking = true` to Info.plist (unblock HTTP localhost). Debug diagnostics also added: launch-time URL print, full DecodingError logging. This confirms the response shape `{ request_id, match: { status, confidence, candidates }, explanation, diagnostics }` is now canonical and exercised end-to-end by real client. Decision D-022.

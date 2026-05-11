@@ -79,3 +79,13 @@ AUTO_MIGRATE=true art-guide-ml ingest met --limit 100 --department-ids 11
 
 **All three fixed by:** Writing a test that exercises the exact production code path (not a mock around it). This skill is now **high-confidence**; it's proven its value and is a repeatable pattern for all future work.
 
+### 2026-05-11 — Fourth "exercise-the-real-path" bug win: iOS Codable shape mismatch in `/v1/identify` response
+
+**Cross-agent:** ios-engineer-2 flipped the app to live-mode against the backend server (running at `http://localhost:8000`) and immediately hit a decode failure. Root cause: the Swift Codable model expected a flat response shape but the server sends a nested `match` envelope. Additionally, per-candidate similarity is named `score` in the wire format but `confidence` in Swift's CodingKey.
+
+**Why this validates the skill:** This is the fourth production bug in a row found by **actually running the real integration path end-to-end**. All prior bugs (SigLIP ingest, SigLIP query, validation handler) were caught by unit tests that exercise the real seam. This bug was caught by the iOS app actually making a network call to the live backend.
+
+The confidence model for the "exercise-the-real-path" skill is now **very high**. Pattern summary: Unit tests catch seams (embedding → route, validation → serialization). Real client integration catches shape/contract misalignment. All three layers — ML, backend, iOS — gain confidence that the actual running system is correct, not just the constituent parts.
+
+**Decision D-022** documents the full fix.
+

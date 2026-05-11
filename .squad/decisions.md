@@ -250,3 +250,23 @@ Other handlers (`_http_handler`, `_unhandled_handler`) were audited and are safe
 **Regression test:** `services/api/tests/test_validation_handler.py` — four tests covering string-where-file-expected, missing required field, `ctx` JSON primitives, and no exception class name exposure. 70/70 tests pass; live server now returns clean 400 bad_request envelope on malformed input instead of 500.
 
 **Owner:** backend-engineer. **Status:** Active. **Date:** 2026-05-10.
+
+## D-022 — iOS live-mode Codable shape reconciliation + local networking fix
+
+**Decision:** Swift models `IdentifyResponse` and `ArtworkCandidate` had mismatches with the server wire format. The server returns `{ request_id, match: { status, candidates }, explanation, diagnostics }` (nested match envelope), but the iOS model expected a flat `{ status, top_candidate, alternates }` structure. Additionally, per-candidate similarity is named `score` in the API contract but `confidence` in Swift, and iOS ATS blocked `http://localhost:8000` silently.
+
+**Fixes applied:**
+1. Reshaped `IdentifyResponse` with `MatchEnvelope` struct (status, confidence, candidates) to match server's nested shape. Computed properties (`status`, `topCandidate`, `alternates`, `disclaimer`, `style`) preserve existing call sites; memberwise init unchanged.
+2. `ArtworkCandidate` CodingKey: `case confidence = "score"` maps the wire field to the view property.
+3. `Info.plist` gains `NSAppTransportSecurity.NSAllowsLocalNetworking = true` — unblocks HTTP to localhost/127.0.0.1/link-local for dev.
+4. Debug diagnostics: `ArtGuideApp.init()` prints resolved base URL on launch. `APIClient` catches and logs full `DecodingError` + first 500 chars of raw body. `APIError.decoding.userFacingMessage` exposes detail in DEBUG.
+
+**Files changed:** `apps/ios/ArtGuide/Models/IdentifyResponse.swift` (MatchEnvelope rewrite), `ArtworkCandidate.swift` (CodingKey), `Info.plist` (ATS), `ArtGuideApp.swift` (launch print), `APIClient.swift` (error logging), `APIError.swift` (DEBUG message).
+
+**Rationale:** Codable shape mismatches are the most common JSON integration bug and almost always hide behind opaque "unexpected response" errors. Tight error logging + confidence in the wire format now exercised by real client. This is the fourth bug found by hitting the live system end-to-end (D-020 transformers incompatibility, D-019 LLM grounding, earlier confidence thresholds).
+
+**Verification path:** `cd apps/ios && ./setup.sh && xcode⌘R` with backend running at `http://localhost:8000`. Console should print `[ArtGuide] API base URL: http://localhost:8000`. Snap photo; should decode successfully and return match status.
+
+**Constraint conformance:** D-007 (API shape).
+
+**Owner:** ios-engineer. **Status:** Active. **Date:** 2026-05-10.
