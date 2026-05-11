@@ -136,3 +136,14 @@ The confidence model for the "exercise-the-real-path" skill is now **very high**
 **Learnings:**
 - **Empty-string normalization is essential for Met data.** `objectBeginDate=0` and `dynasty=""` are the Met's way of saying "absent"; the ingest layer must normalize both to `None` or downstream queries see misleading zeroes.
 - **Backfill-not-re-embed is the right pattern for metadata-only updates.** Re-ingesting 100 records to backfill 7 text fields would waste ~10 minutes of embed time and discard valid embedding vectors. The `backfill_met_enrichment` pattern (fetch JSON, UPDATE columns only) is repeatable for every future field addition.
+
+## 2026-05-11 — Wave 1 Museum-Plaque Enrichment (Tier a) Complete
+
+**Status:** All tier (a) enrichment shipped. Backend API response shape finalized (D-026 API). iOS rendering complete (D-026 iOS UX + MuseumSourceRow). Metadata layer ready for Wave 2 LLM prompt.
+
+**What shipped:**
+- Migration, schema, ingest mapper, backfill CLI — all live in ml-retrieval-engineer agent.
+- Backend API now returns 7 new fields in `Candidate` (artist_bio, credit_line, dimensions, dynasty, object_wikidata_url, date_begin, date_end).
+- iOS result views render "View on {museum}" link below explanation + defensive debug-bracket stripping.
+
+**Next:** Wave 2 (Docent/plaque LLM prompt). Depends on Azure OpenAI Phase 1 deployment. backend-engineer will finalize `build_prompt()` template for plaque prose; iOS will render single explanation paragraph (no field list).

@@ -4,6 +4,29 @@
 
 ## Current Status
 
+### 2026-05-10 — Tier (a) museum-plaque enrichment: API response shape (D-026)
+
+**Task:** Extend the `POST /v1/identify` response to surface D-024 tier (a) enrichment fields per the museum-plaque directive.
+
+**Changes:**
+- `app/schemas.py`: `Candidate` gains 7 new nullable fields (`artist_bio`, `credit_line`, `dimensions`, `dynasty`, `object_wikidata_url`, `date_begin`, `date_end`). `GroundedField` Literal extended with 4 LLM-groundable values.
+- `app/db.py`: `ArtworkRepository.nearest_neighbors` SQL SELECT now includes all 7 new columns (both source and WHERE-filtered paths). Columns are consumed opportunistically — if the migration hasn't run yet, asyncpg will raise a column-not-found error at runtime; ml-retrieval-engineer owns the migration via AUTO_MIGRATE.
+- `app/llm.py`: `_GROUNDABLE_FIELDS` extended with `artist_bio`, `credit_line`, `dimensions`, `dynasty`. `object_wikidata_url`, `date_begin`, `date_end` are NOT in groundable fields (retrieval/forward-compat only per D-024).
+- `app/routes/identify.py`: `_row_to_candidate` maps all 7 new fields.
+- `packages/shared/api/identify-response.schema.json`: `Candidate` def + `grounded_fields` enum extended.
+- `docs/api.md`: Candidate field table and `grounded_fields` description updated.
+
+**Tests (73 passing, +3):**
+- `test_candidate_includes_enrichment_fields_when_populated` — fields appear when row contains them.
+- `test_candidate_enrichment_fields_null_when_absent` — no error when row omits them.
+- `test_grounded_fields_includes_enrichment_fields_when_populated` — four prose-groundable fields appear in `grounded_fields`; forward-compat trio does not.
+
+**Coordination:**
+- Field names match D-024 exactly; ml-retrieval-engineer adds the matching columns via schema migration.
+- ios-engineer can now read `artist_bio`, `credit_line`, `dimensions`, `dynasty` from `match.candidates[*]`.
+
+---
+
 ### 2026-05-10 — `_validation_handler` JSON serialization fix
 
 **Bug:** `POST /v1/identify` with a string where `UploadFile` was expected caused `RequestValidationError`. The handler passed `exc.errors()` directly to `JSONResponse`. Pydantic v2 error dicts include a `ctx.error` field containing the raw `ValueError` object, which `json.dumps` cannot serialize → 500 `TypeError`.
@@ -154,3 +177,14 @@ All 70 tests pass. Live server verified: `curl -F "image=string" http://localhos
 - D-025 in decisions.md — design rationale
 
 **Rate limit note:** Local rate limit is 10 req/5 min. Use `--request-delay-s 35` when running eval locally. In CI, set `RATE_LIMIT_REQUESTS=200 RATE_LIMIT_WINDOW_SECONDS=60`.
+
+## 2026-05-11 — Wave 1 Museum-Plaque Enrichment (Tier a) Complete
+
+**Status:** All tier (a) enrichment shipped. API response shape finalized (D-026 API). 73 tests passing (+3 new). ml-retrieval-engineer backfilled 100 records; iOS rendering complete; metadata layer ready for Wave 2 LLM prompt.
+
+**What shipped:**
+- `Candidate` model gains 7 new nullable fields; 4 in `_GROUNDABLE_FIELDS` (artist_bio, credit_line, dimensions, dynasty).
+- `ArtworkRepository.nearest_neighbors` SQL SELECT includes all 7 columns; forward-compat trio (object_wikidata_url, date_begin, date_end) never appears in grounded_fields.
+- JSON schema + API docs updated.
+
+**Next:** Wave 2 (Docent/plaque LLM prompt). Depends on Azure OpenAI Phase 1 deployment. Will finalize `build_prompt()` template for plaque prose (all confidence bands); iOS will render single explanation paragraph.

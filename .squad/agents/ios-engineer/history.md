@@ -165,6 +165,21 @@ silently break local dev" (ATS, Codable mismatch, xcconfig propagation).
 
 **Impact for iOS:** The app's error-handling code can now assume all HTTP 4xx responses are properly formatted API errors (never internal server failures mis-reported as 4xx). Simplifies retry logic and user messaging.
 
+### 2026-05-10 — "View on {museum}" button + debug-prefix stripping (D-026)
+
+**Fix 1 — MuseumSourceRow:** New `Views/Components/MuseumSourceRow.swift` component renders a tasteful footer row below the explanation block in `ExactMatchView`, `LikelyMatchView`, and `StyleOnlyView`. Label is museum-name-aware ("View on {museum}"), with a "Source: {museum}" caption. Tap opens `source_url` via `UIApplication.shared.open`. Replaced the old subtle "View source" link in `ArtworkCard.full` (removed duplication). Row is gated on `candidate.sourceURL != nil` so it's invisible for `style_only` results that carry no URL.
+
+**Fix 2 — displayText:** `Explanation.displayText` strips any leading `[…]` debug bracket (e.g. `[LLM call skipped -- AZURE_OPENAI not configured]`) via regex before text reaches the UI. `ExplanationBlock` and `NoMatchView` now use `displayText`. Defensive: the app stays correct regardless of whether backend cleans the source (note for backend-engineer: stop emitting the bracket in JSON).
+
+**Museum-plaque fields — deferred:** D-024 tier (a) fields (`artist_bio`, `credit_line`, `dimensions`, `dynasty`) will appear in future API responses. iOS synthesized Codable ignores unknown JSON keys by default — no decoder changes needed. Wave 2 will weave these into LLM prose; no list UI will ever be added for them.
+
+**Tests added:**
+- `ArtGuideTests/ExplanationTests.swift` — 8 unit tests for `displayText` (strip, no-strip, edge cases)
+- `ArtGuideTests/ArtworkCandidateTests.swift` — 5 decoding tests (`source_url` mapping, `museum`, unknown-key tolerance)
+- `project.yml` updated with `ArtGuideTests` unit-test target + scheme wiring
+
+**Files changed:** `Explanation.swift`, `MuseumSourceRow.swift` (new), `ArtworkCard.swift`, `ExactMatchView.swift`, `LikelyMatchView.swift`, `StyleOnlyView.swift`, `ResultView.swift`, `project.yml`, test files.
+
 
 ## 2026-05-11 — Eval bootstrap shipped; explanation UX now gated by eval thresholds
 
@@ -185,3 +200,16 @@ silently break local dev" (ATS, Codable mismatch, xcconfig propagation).
 - `services/ml/eval/dataset.jsonl` — test cases (use for manual spot checks of edge cases)
 - `services/ml/eval/baseline-2026-05-11T06-30-17Z.json` — baseline snapshot
 - D-025 + D-026 in decisions.md — eval design & explanation UX decision
+
+## 2026-05-11 — Wave 1 Museum-Plaque Enrichment (Tier a) Complete
+
+**Status:** All tier (a) enrichment shipped. iOS result views updated (D-026 iOS UX). 13 new unit tests passing. Codable forward-proofing complete; app silently ignores 7 new API fields until Wave 2.
+
+**What shipped:**
+- New `MuseumSourceRow` component renders "View on {museum}" link + "Source: {museum}" caption; opens source_url via UIApplication.shared.open.
+- `Explanation.displayText` computed property strips leading `[…]` debug bracket (defensive; backend follow-up in place).
+- ExactMatchView, LikelyMatchView, StyleOnlyView integrate MuseumSourceRow.
+- Codable regression test ensures unknown fields (artist_bio, credit_line, dimensions, dynasty, object_wikidata_url, date_begin, date_end) are silently ignored.
+- XcodeGen wiring + ArtGuideTests target integrated into scheme.
+
+**Next:** Wave 2 (Docent/plaque LLM prompt). Awaits Azure OpenAI deployment. Will update ExplanationBlock to render richer plaque prose (single paragraph, no field list) — TODO in place.
