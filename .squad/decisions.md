@@ -232,3 +232,21 @@ D-002 (retrieval-first), D-003 (single service), D-005 (confidence), D-007 (API)
 **Test coverage:** Added `test_identify_query_code_path_returns_finite_vector` in ML; added `test_identify_real_forward_path_returns_200` in API. Both exercise the real forward path. All 66 API tests pass.
 **Verification:** curl against `/v1/identify` with real JPEG returns 200 with status="likely" and Met candidates.
 **Owner:** ml-retrieval-engineer. **Status:** Resolved. **Date:** 2026-05-10.
+
+## D-021 — All error handlers must sanitize before JSONResponse
+**Decision:** All custom exception handlers must sanitize non-JSON-serializable values before calling `error_response()` / `JSONResponse`.
+
+Concretely: any handler that passes structured data (not just a plain string message) into the response body must ensure every value in that structure is a JSON primitive (`str`, `int`, `float`, `bool`, `None`, or a container of those). Exception objects, dataclasses, Pydantic models, and other non-JSON types must be converted to strings (using `str()`, not `repr()`, to avoid leaking class names).
+
+**Applied fix in `services/api/app/main.py`:**
+1. `_sanitize_validation_errors(raw_errors)` — walks Pydantic error dicts and replaces any `Exception` in `ctx` with `str(exc)`.
+2. `_validation_summary(errors)` — builds a human-readable single-line message from the first error's `loc` + `msg` without leaking the Python exception class.
+3. `_validation_handler` calls both before `error_response()`.
+
+Other handlers (`_http_handler`, `_unhandled_handler`) were audited and are safe.
+
+**Propagation rule:** When adding any future exception handler that passes `details=` or other structured data to `error_response()`, run the structured data through `_sanitize_validation_errors` or write an equivalent sanitiser. Never pass a raw `exc.errors()`, `exc.__dict__`, or any object that may contain Python exception instances. Add a test that exercises the real handler path and asserts the response is valid JSON.
+
+**Regression test:** `services/api/tests/test_validation_handler.py` — four tests covering string-where-file-expected, missing required field, `ctx` JSON primitives, and no exception class name exposure. 70/70 tests pass; live server now returns clean 400 bad_request envelope on malformed input instead of 500.
+
+**Owner:** backend-engineer. **Status:** Active. **Date:** 2026-05-10.

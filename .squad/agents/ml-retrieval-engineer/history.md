@@ -22,7 +22,27 @@
 
 ## Latest Learning
 
-### 2026-05-11 — Production ingest bugfixes (Met 406 + SigLIP `.pooler_output`)
+### 2026-05-10 — Query path `BaseModelOutputWithPooling` crash (transformers 5.x upgrade)
+
+**Bug:** POST `/v1/identify` returned 400 `"Image could not be decoded: 'BaseModelOutputWithPooling' object has no attribute 'detach'"`. Server was up, embedder warmed, DB had 100 records — bug fired only on the query path.
+
+**Root cause:** `transformers==5.8.0` changed `SiglipModel.get_image_features()` and `CLIPModel.get_image_features()` to return `BaseModelOutputWithPooling` instead of a plain `torch.Tensor`. The ingest-path fix from the prior batch was written against `transformers==4.46.2` semantics. `_HFEmbedder._forward` assumed the Tensor was returned directly; `.detach()` on a `BaseModelOutputWithPooling` raises `AttributeError`. The broad `except Exception` in the identify route then mis-reported this as a PIL decode error (400), further masking the real failure.
+
+**Fix:**
+1. `_forward` now does `raw.pooler_output if hasattr(raw, "pooler_output") else raw` for siglip/openclip — handles both ≤4.46.x (plain Tensor) and ≥5.x (BaseModelOutputWithPooling).
+2. Split the monolithic `except Exception` in `identify.py` into two: PIL decode failures → 400, model inference failures → 500.
+3. Added `test_identify_query_code_path_returns_finite_vector` to `test_embeddings.py` — calls `_to_pixel_values → _forward` directly (the actual identify code path), not just `embed_bytes`.
+4. Added `_FakeEmbedderWithForward` + `test_identify_real_forward_path_returns_200` to `test_identify_route.py` — forces the route into the production `_forward` branch using a real PIL-decodable JPEG.
+
+**Verification:** 4 ML tests + 12 API tests green. `curl -F "image=@DeathOfSocrates.jpg" http://localhost:8000/v1/identify` → 200 OK with real candidates.
+
+### Learnings
+
+- **`get_image_features()` return type is NOT stable across transformers versions.** 4.46.x returned a plain Tensor; 5.x returns BaseModelOutputWithPooling. Future: always verify in REPL after any transformers upgrade and add a version-detection guard in `_forward`.
+- **This is the SECOND time the same test gap bit us.** First: ingest path crashed because `pooler_output` assumption was wrong. Now: query path crashed because `get_image_features()` return type changed. Both times the production break could have been caught by a test that calls `_to_pixel_values → _forward` (the actual production code path). The pattern: we fixed the seam, wrote a unit test for `embed_bytes`, but left `_forward` uncovered by the route test. **Every time you fix a seam, write a test that exercises the seam the way production exercises it — not a convenience wrapper around it.**
+- **A broad `except Exception` that produces a misleading message is worse than no handler.** `"Image could not be decoded"` for a model inference failure wastes hours of debugging time. Split error domains: PIL decode → 400, model failure → 500.
+
+
 
 Two production blockers reported by max-montes against `art-guide-ml ingest met --limit 100 --department-ids 11` encountered in dry run. Fixed both:
 
@@ -46,4 +66,16 @@ AUTO_MIGRATE=true art-guide-ml ingest met --limit 100 --department-ids 11
 - **Always exercise the real code path in at least one test.** A `@skipif(not_cached)` test that skips in fresh environments is *worse than no test* — lets bugs ship under green CI. Run the real path, provide in-process surrogate, or fail loudly when skip would happen in prod CI.
 
 
+
+
+### 2026-05-10 — Third "exercise-the-real-path" bug win: backend validation handler 500 crash
+
+**Cross-agent:** backend-engineer fixed `_validation_handler` in `services/api/app/main.py` to sanitize Exception objects out of Pydantic error dicts before JSON encoding.
+
+**Why this validates the skill:** The pattern "exercise the real code path in tests" caught three production bugs today:
+1. SigLIP ingest `.pooler_output` crash on `transformers==4.46.2` — mock `embed_bytes` didn't call `_forward`.
+2. SigLIP query `BaseModelOutputWithPooling` crash on `transformers==5.8.0` — route test used `_FakeEmbedder`, not real `_forward`.
+3. Validation handler 500 crash — live multipart request with wrong type triggered `TypeError` in `_sanitize_validation_errors` before fix; test-only mocks wouldn't have found it.
+
+**All three fixed by:** Writing a test that exercises the exact production code path (not a mock around it). This skill is now **high-confidence**; it's proven its value and is a repeatable pattern for all future work.
 

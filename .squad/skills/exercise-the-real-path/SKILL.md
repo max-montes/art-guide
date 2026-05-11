@@ -50,3 +50,18 @@ The pattern that bit `art-guide`: a SigLIP embedder unit test was guarded by `@p
 - Hardware-bound tests (GPU-only, > 30 s on CPU) genuinely belong in a nightly lane. The relaxation is moving them, not skipping them silently.
 - Network-bound tests that require paid APIs or rate-limited endpoints belong behind a recorded-fixture layer (e.g. `vcrpy`), not a `skipif`.
 - The skill is "execute the path", not "execute it on every developer's laptop". The goal is that *some* automated run, on *every* PR, exercises the real code — not that every contributor pays the load cost locally.
+
+## Confirmations
+
+Three production bugs caught by this skill in a single day (2026-05-10):
+
+1. **SigLIP ingest `pooler_output` crash** — Unit test skipped silently; `.pooler_output` was never called, so the wrong assumption (`get_image_features` returns an output object) shipped under green CI. Real ingest crashed on first batch.
+
+2. **SigLIP query `BaseModelOutputWithPooling` crash** — Route test used `_FakeEmbedder` mock instead of calling `_forward` with the real model. On `transformers==5.8.0`, `get_image_features` return type changed to `BaseModelOutputWithPooling`, which doesn't have `.detach()`. Real query crashed with 400 (mis-reported as PIL decode).
+
+3. **Validation handler `ValueError` JSON crash** — `POST /v1/identify` with wrong multipart field type (string instead of UploadFile) triggered `ValueError` in Pydantic error ctx. The custom `_validation_handler` passed the error dict directly to `JSONResponse` without sanitizing the Exception object, causing `TypeError` (not JSON-serializable), which returned 500 instead of 400.
+
+All three fixed by writing a test that exercises the real code path with realistic inputs and asserts a property of the result (vector shape/norm, HTTP status, JSON envelope).
+
+**Skill status:** High confidence. Proven pattern across three independent domains (ML ingest, ML query, API error handling). Recommend as mandatory practice for all future seam tests.
+

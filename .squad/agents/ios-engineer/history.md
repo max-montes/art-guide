@@ -126,3 +126,10 @@ ml-retrieval-engineer fixed SigLIP embedder `.pooler_output` crash and Met HTTP 
 
 **For iOS:** Backend endpoint is now fully operational with real Met artwork matching and confidence-aware status. Exception handling improved (PIL decode errors 400, embedding failures 500). You can now flip `MockAPIClient` → `APIClient` in `ArtGuideApp.swift` and test real end-to-end flows with local or prod backend. Status-aware guardrails applied to LLM explanations; query path fully tested.
 
+
+### 2026-05-10 — API error handling now returns clean 4xx envelopes
+
+**Cross-agent:** backend-engineer fixed validation error handling in `services/api/app/main.py`. Malformed requests (e.g., string instead of UploadFile) now return a clean 400 bad_request JSON envelope instead of a 500.
+
+**Impact for iOS:** The app's error-handling code can now assume all HTTP 4xx responses are properly formatted API errors (never internal server failures mis-reported as 4xx). Simplifies retry logic and user messaging.
+
