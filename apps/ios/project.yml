@@ -1,0 +1,120 @@
+# XcodeGen project spec for ArtGuide.
+#
+# This file is the source of truth for the iOS Xcode project. To regenerate
+# the .xcodeproj after changing this spec, run `./setup.sh` (or `xcodegen
+# generate`) from this directory. Do NOT edit the generated .xcodeproj by
+# hand — your edits will be wiped on the next regenerate.
+#
+# Why XcodeGen (vs. checking in a .xcodeproj or hand-rolling one in the
+# Xcode UI): the project is reproducible from a small text spec, the spec
+# lives in source control, and the painful manual dance of Info.plist /
+# xcconfig wiring is encoded once here.
+#
+# Key gotcha encoded below: GENERATE_INFOPLIST_FILE is forced OFF and
+# INFOPLIST_FILE is pinned to the on-disk ArtGuide/Info.plist. Xcode's
+# default (auto-generated plist) silently shadows the on-disk one, which is
+# why the previous manual setup was painful.
+
+name: ArtGuide
+
+options:
+  bundleIdPrefix: com.maxmontes
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+# Project-wide build settings. Target-level settings below override these
+# where needed.
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    # Leave DEVELOPMENT_TEAM empty so Xcode auto-fills the developer's
+    # personal Apple ID team on first open. Code signing stays automatic.
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_MODULE_VERIFIER: NO
+
+targets:
+  ArtGuide:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+
+    # Pull in every Swift file under ArtGuide/, but exclude the on-disk
+    # Info.plist (wired via INFOPLIST_FILE below) and the xcconfig (wired
+    # via configFiles below) so they don't get bundled as resources.
+    sources:
+      - path: ArtGuide
+        excludes:
+          - "Info.plist"
+          - "Config/Config.xcconfig"
+          - "Config/Config.local.xcconfig"
+          - "**/.DS_Store"
+
+    configFiles:
+      Debug: ArtGuide/Config/Config.xcconfig
+      Release: ArtGuide/Config/Config.xcconfig
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.maxmontes.artguide
+        PRODUCT_NAME: ArtGuide
+        # Critical: do NOT auto-generate an Info.plist. Use the one on disk
+        # so the camera/photo usage strings and API_BASE_URL/API_KEY keys
+        # actually ship in the built app.
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: ArtGuide/Info.plist
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        # iPhone + iPad both get the binary; runtime orientation lock is in
+        # Info.plist. Personal-team signing supports either.
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+        # Be explicit even though they're the project defaults — keeps the
+        # generated project deterministic across XcodeGen versions.
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+
+  ArtGuideTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: ArtGuideTests
+    dependencies:
+      - target: ArtGuide
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/ArtGuide.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ArtGuide"
+        PRODUCT_BUNDLE_IDENTIFIER: com.maxmontes.artguide.tests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  ArtGuide:
+    build:
+      targets:
+        ArtGuide: all
+    run:
+      config: Debug
+      # Pre-seed the mock-scenario env var so max-montes can flip the
+      # Simulator into a specific status by editing the scheme. Default
+      # `cycle` rotates through every UI state.
+      environmentVariables:
+        - variable: ART_GUIDE_MOCK_SCENARIO
+          value: cycle
+          isEnabled: true
+    test:
+      config: Debug
+      targets:
+        - ArtGuideTests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

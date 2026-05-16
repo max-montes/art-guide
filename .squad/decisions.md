@@ -494,3 +494,25 @@ Prod Postgres (`art-guide-prod-pg.postgres.database.azure.com`, database `artgui
 The Phase 1 critical path requires real catalog data in prod before iOS integration testing can proceed against live infrastructure. 100 records (European Paintings, department 11) mirrors the local corpus and provides sufficient coverage to validate retrieval quality before scaling to the full Met catalog (~50K records).
 
 **Constraint conformance:** D-002 (retrieval-first), D-004 (Met Phase 1), D-006 (single image pipeline), D-012 (no raw images stored), D-015 (SigLIP-base-224), D-027 (Wave 1 enrichment).
+
+## D-030 — XcodeGen regen protocol: documentation-enforced
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Context:** Brady (Max) was blocked with 14 Xcode "Cannot find X in scope" errors after Swift files were added to disk without re-running `xcodegen generate`. This was the second occurrence of this failure mode (also 2026-05-10).
+
+**Decision:** Documentation-based enforcement. Every agent/developer must run `cd apps/ios && xcodegen generate` and commit the updated `.xcodeproj` alongside any new `.swift` files. Enforced via:
+1. A `⚠️ ⚠️ CRITICAL` callout at the top of `apps/ios/README.md`.
+2. Updated `xcodegen-app-spec` SKILL.md with the regen requirement promoted to the very top, symptom description, and confidence bumped to `high`.
+
+**Rejected options:** Pre-commit hook (adds tooling requirement for all contributors; overkill for solo dev), restructuring `project.yml` (already uses correct recursive glob — regen was simply skipped, not a spec issue).
+
+**Constraint:** The `.xcodeproj` is gitignored per project convention (`project.yml` is source of truth). Regen is a manual step after every Swift file addition.
+
+## D-031 — MockAPIClient uses OSAllocatedUnfairLock (not NSLock) for Swift 6 async safety
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Decision:** Replace `NSLock` with `OSAllocatedUnfairLock<Int>` in `MockAPIClient` to eliminate the Swift 6 strict-concurrency warning ("instance method 'lock' is unavailable from asynchronous contexts").
+
+**Why OSAllocatedUnfairLock (not actor):** `MockAPIClient` is `final class` conforming to `APIClientProtocol`. Its mutable properties (`scenario`, `forcedResponse`, `forcedError`, `simulatedLatency`) are accessed synchronously from previews and tests. Converting to `actor` would require `await` at every property access. `OSAllocatedUnfairLock<State>` is async-safe, available on iOS 16+ (matches deployment target), and requires zero call-site changes.
+
+**Result:** `BUILD SUCCEEDED`, 0 errors, 0 warnings, 13/13 tests pass.

@@ -46,6 +46,28 @@ Prod is now fully end-to-end live (D-029). You can test the iOS app against the 
 
 ## Learnings
 
+**XcodeGen regen is mandatory after adding Swift files (second incident — 2026-05-16):**
+- Symptom: cascade of "Cannot find X in scope" in Xcode for types that exist on disk.
+- Root cause: `.xcodeproj` compile-phase list is static until `xcodegen generate` runs.
+- Fix: `cd apps/ios && xcodegen generate` + commit the result alongside new Swift files.
+- Regression prevention chosen: Documentation (prominent callout in `apps/ios/README.md`
+  + `⚠️ CRITICAL` heading in `xcodegen-app-spec` SKILL.md). Pre-commit hook deferred.
+- See `.squad/decisions/inbox/ios-engineer-xcodegen-regen-protocol.md`.
+
+**MockAPIClient async lock (2026-05-16):**
+- `NSLock.lock()/unlock()` inside `async func` is a Swift 6 error (warning in 5.9/5.10).
+- Pattern chosen: `OSAllocatedUnfairLock<Int>` (Option A) — async-safe `withLock` closure,
+  zero call-site changes, available iOS 16+ matching our deployment target.
+- Did NOT convert to `actor` because `MockAPIClient`'s mutable properties are accessed
+  synchronously from previews/tests and would require `await` at every access.
+- See `.squad/skills/swift-actor-vs-lock/SKILL.md` for the full decision tree.
+
+**ArtGuideTests plist fix (2026-05-16):**
+- Unit-test bundle was missing `GENERATE_INFOPLIST_FILE: YES` in project.yml, causing
+  code-sign failure on `xcodebuild test`. Fixed by adding to `ArtGuideTests` target settings.
+
+**Build status 2026-05-16:** BUILD SUCCEEDED, all 13 tests pass, zero warnings.
+
 **Config pattern works well:**
 - `Config.xcconfig` + `AppConfig.swift` provides clean env override without hardcoding URLs/keys.
 - Fits the "same image for local + prod" pattern (D-011).

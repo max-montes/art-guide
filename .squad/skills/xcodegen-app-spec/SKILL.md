@@ -1,11 +1,25 @@
 ---
 name: xcodegen-app-spec
 purpose: Generate a single-target SwiftUI iOS app .xcodeproj from a YAML spec, wiring an existing on-disk Info.plist + xcconfig + scheme env vars correctly.
-when_to_use: You have Swift sources, an Info.plist, and an xcconfig already on disk, but no .xcodeproj — and you want a reproducible, source-controllable project file rather than asking developers to click through Xcode's New Project wizard.
-last_validated: 2026-05-10
+when_to_use: You have Swift sources, an Info.plist, and an xcconfig already on disk, but no .xcodeproj — and you want a reproducible, source-controllable project file rather than asking developers to click through Xcode's New Project wizard. ALSO run `xcodegen generate` any time you add Swift files to disk.
+last_validated: 2026-05-16
+confidence: high
 ---
 
 # xcodegen-app-spec
+
+## ⚠️ CRITICAL: Regen is mandatory when adding Swift files
+
+**Symptom when you skip it:** Xcode shows a cascade of "Cannot find type X in scope" /
+"Cannot find Y in scope" errors for types that clearly exist on disk — because the
+`.xcodeproj` compile-phase list hasn't been updated.
+
+**Fix (one command):**
+```bash
+cd apps/ios && xcodegen generate
+```
+
+Then commit the regenerated `.xcodeproj` alongside your new Swift file.
 
 ## Problem
 
@@ -139,9 +153,17 @@ needing a signing identity — useful in CI or on a fresh clone.
 
 - **xcconfig comment syntax bites URLs.** `//` starts a comment even
   inside a value. Escape with `$()`: `API_BASE_URL = https:/$()/example.com`.
-- If you add a new top-level folder under the sources path, re-run
-  `./setup.sh` so XcodeGen picks it up — the spec uses a directory glob,
-  not a file list, but the project file is static until regenerated.
+- **Adding Swift files requires regen.** The spec uses a directory glob,
+  not a file list. The `.xcodeproj` is static between `xcodegen generate`
+  runs. Every time you add a new `.swift` file (or folder) to disk, you
+  must re-run `xcodegen generate` and commit the updated `.xcodeproj` or
+  Xcode will show "Cannot find X in scope" for all types in the new file.
+  This failure pattern has occurred twice in this project (2026-05-10,
+  2026-05-16).
+- **Unit-test target needs `GENERATE_INFOPLIST_FILE: YES`.** Unlike the
+  app target (which pins an on-disk plist), the test bundle has no custom
+  `Info.plist`. Add this to the test target's `settings.base` or code
+  signing will fail: `GENERATE_INFOPLIST_FILE: YES`.
 - Don't put the `Info.plist` or xcconfig under `sources:` without the
   `excludes:` block above; XcodeGen will otherwise add them as resources
   and you'll see duplicate-Info.plist warnings.
