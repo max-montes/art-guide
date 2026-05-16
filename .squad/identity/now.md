@@ -1,6 +1,6 @@
 ---
-updated_at: 2026-05-11T02:19:46Z
-focus_area: Phase 1 critical path closed — populate catalog, flip iOS live, bootstrap eval
+updated_at: 2026-05-16T22:13:00Z
+focus_area: Azure prod live; catalog next; iOS integration testing
 active_issues: []
 ---
 
@@ -8,44 +8,49 @@ active_issues: []
 
 ## Status
 
-**Design AND retrieval critical path are both complete.**
+**Azure prod stack is LIVE with real image.** Backend-engineer shipped v1 image (art-guide-api:v1) to Azure Container Apps revision art-guide-prod-api--0000003. All core endpoints returning 200. Postgres+pgvector + Key Vault + bearer auth fully operational.
 
-All cross-cutting decisions locked in `docs/` and `.squad/decisions.md` (D-001 through D-019):
+**Phase 1 milestones:**
 - API contract v0 ✓
 - Data + confidence model ✓
-- Image pipeline ✓
-- Embedding selection (SigLIP-base-224, 768-dim) ✓
-- Deployment + environments ✓
+- Image pipeline (single `prepare_for_embedding` function) ✓
+- Embedding (SigLIP-base-patch16-224, 768-dim, bundled in image) ✓
+- Deployment (Azure prod stack + local Docker Compose) ✓
 - Privacy + observability ✓
+- Production image built & deployed ✓ (D-028)
+- Museum-plaque LLM prompt design locked ✓ (D-026)
+- Enrichment tier (a) backfill complete (D-027)
 
-**Phase 1 retrieval pipeline wired end-to-end** (from backend-engineer-3 session):
-- Docker Compose: Postgres + pgvector ✓
-- Env-driven settings + async asyncpg ✓
-- Schema migrations + HNSW index ✓
-- SigLIP embedder warmup in FastAPI lifespan ✓
-- `/v1/identify` query path: embed → nearest_neighbors → confidence → grounded LLM ✓
-- 65 unit tests passing; smoke tests confirm `/healthz`, `/version`, `503` on no-embedder ✓
+**Infrastructure now live:**
+- Prod API: `https://art-guide-prod-api.kindglacier-84ffc0b4.westus3.azurecontainerapps.io` (static bearer auth)
+- Postgres Flexible Server + pgvector (migrations applied)
+- Azure Key Vault (bearer token + future secrets)
+- ACR image registry + Container Apps orchestration
+- iOS Config.local.xcconfig wired to prod
 
-Deliverables on disk:
-- Backend: FastAPI service with full retrieval+RAG pipeline, non-fatal LLM failure handling
-- ML: `services/ml/ml/ingest/met_db.py` ingest CLI (dry-run ready)
-- iOS: SwiftUI app scaffolding with mocked status views + XcodeGen project spec (D-017)
-- Infra: docker-compose.yml with Postgres+pgvector, local dev / prod env split
+**Blockers lifted:**
+- Backend-engineer ready for iOS integration
+- ml-retrieval-engineer can ingest to prod Postgres
+- Evaluation bootstrap unblocked (AOAI gpt-5-mini deployed)
 
 ## Next concrete work
 
 In priority order:
 
-1. **Populate catalog**: `art-guide-ml ingest met --limit 100 --department-ids painting,sculpture` to populate Postgres with initial Met records. Verify /v1/identify retrieval works end-to-end (confidence scores, candidates flow).
-2. **iOS flip to live mode**: One-line change in `ArtGuideApp.swift` (APIClient) + `Config.xcconfig` point at `http://localhost:8000`. Test on simulator with local backend running.
-3. **Bootstrap evaluation**: Load retrieval-v1 dataset (Met reference images + augmentations + Wikimedia) into local eval suite. Run confidence + grounding evaluators. Pin baseline metrics.
-4. **Field-name reconciliation**: Audit `artist` vs `artist_name`, `date` vs `date_start`, etc. across source adapters → canonical `NormalizedArtwork`. Codify in D-020 if schema changes needed.
+1. **Ingest Met catalog to prod** (ml-retrieval-engineer): `art-guide-ml ingest met` → prod Postgres (100 initial, then full ~50K set). Verify `/v1/identify` retrieval works end-to-end with real data.
+2. **iOS end-to-end test** (ios-engineer): Create `.xcodeproj`, build + run in Simulator against live prod. Test camera → upload → identify endpoint. Monitor cold-start latency (first request blocks ~10–30s).
+3. **Bootstrap eval** (ml-retrieval-engineer): Load retrieval-v1 dataset, run confidence + grounding evaluators, pin D-025 baseline metrics.
+4. **Monitor cold-start** (backend-engineer + ios-engineer): Gather real latency data; decision in Phase 2 on minReplicas=1 vs. background task warm-up (D-028 operational note).
 
-## Out of scope right now
+## Out of scope Phase 1
 
-Anything in D-013. Don't speculate.
+- Wave 2 plaque LLM refinement (unblocked for Phase 2; foundation in place)
+- Catalog expansion beyond Met (Phase 4; adapters ready per D-004)
+- Fine-tuning, Core ML on-device, multi-region (D-013 defer list)
 
 ## Coordinator notes
 
-- Project owner is iterating on planning + design with a parallel Copilot CLI session. Treat decisions in `.squad/decisions.md` as authoritative; defer ambiguous design questions back to them.
-- Xcode is being installed; don't block on iOS build verification.
+- Azure prod stack is operator-ready. Team can now work against live infrastructure.
+- Cold-start latency is an operational note, not a blocker for v1. Revisit if eval P99 regresses.
+- Catalog ingest and iOS testing can happen in parallel.
+- Historical archives: updated backend-engineer and ios-engineer `history-archive.md` (files >15KB summarized per scribe workflow).

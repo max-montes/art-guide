@@ -436,3 +436,33 @@ New fields from D-024 tier (a) (`artist_bio`, `credit_line`, `dimensions`, `dyna
 **Constraint conformance:** D-002, D-005, D-007, D-024.
 
 **Owner:** ml-retrieval-engineer. **Date:** 2026-05-10.
+
+## D-028 — Dockerfile v1 for art-guide-api prod image
+
+**Decision:** Azure prod Container App `art-guide-prod-api` (RG `art-guide-prod-rg`, westus3, D-023) was provisioned with an MCR `hello-world` placeholder. First real image ships with:
+- Base: `python:3.11-slim-bookworm` (most mature ML wheel coverage; 3.12 requires SDist builds for niche modules).
+- Multi-stage build: builder stage with toolchain, runtime stage with only essential libraries.
+- Bundle SigLIP weights: `google/siglip-base-patch16-224` (D-015 — not so400m) downloaded at build time to `/opt/hf-cache`, image is ~1 GiB, cold start self-contained with `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1`.
+- Server: uvicorn directly (1 worker, no gunicorn). SigLIP holds ~1.5 GiB/process; 2 workers would OOM. Container Apps scales horizontally instead (`minReplicas=0`, `maxReplicas=2`).
+- Healthcheck on `/healthz` (not `/health`), non-root `app` user (uid 1000).
+- `.dockerignore` at repo root excludes `**/.venv/`, `**/tests/`, `apps/`, `infra/`, `docs/`, `.git/`, `.squad/`, `services/ml/data/`, `.env*`, `.secrets-local/`. Keeps `services/ml/eval/` and `services/ml/evals/` because `pyproject.toml` lists them as packages.
+- Built via `az acr build` (remote build, not local push): tar context ~760 KiB, 8m23s first build, layer cache in ACR.
+- Image tags: `art-guide-api:v1` + `art-guide-api:latest`. Deployments pin `vN` explicitly.
+
+**Verification:** All endpoints healthy:
+```
+GET /healthz  → 200 {"status":"ok"}
+GET /version  → 200 {"name":"art-guide-api","version":"0.1.0","api_version":"v1"}
+GET /readyz   → 200 {"status":"ready","db":"ok"}
+GET /docs     → 200 Swagger UI (with Authorization: Bearer …)
+revision art-guide-prod-api--0000003: healthState=Healthy, provisioningState=Provisioned
+```
+
+**Operational note — cold start:** `warm_embedder()` runs synchronously in FastAPI lifespan. Cold revision (replicas: 0 → 1) blocks ~10–30s while SigLIP loads. First request after scale-to-zero can hit connection reset during model load (subsequent requests <150 ms). Options (defer to Phase 2): move warm_embedder to background task (fall back to 503), or set `minReplicas=1` (+$5–10/mo). For v1 with no real users, leave as-is.
+
+**Files:** `services/api/Dockerfile`, `services/api/.dockerignore`, `/.dockerignore` (repo root), `.squad/skills/acr-remote-build/SKILL.md`.
+
+**Constraint conformance:** D-003 (single FastAPI container), D-011 (local + prod only), D-012 (no image bytes — no write path for user uploads), D-015 (SigLIP-base-224 baked in), D-023 (Azure prod stack).
+
+**Owner:** backend-engineer. **Status:** Shipped — revision art-guide-prod-api--0000003 healthy. **Date:** 2026-05-16.
+

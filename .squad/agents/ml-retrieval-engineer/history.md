@@ -147,3 +147,18 @@ The confidence model for the "exercise-the-real-path" skill is now **very high**
 - iOS result views render "View on {museum}" link below explanation + defensive debug-bracket stripping.
 
 **Next:** Wave 2 (Docent/plaque LLM prompt). Depends on Azure OpenAI Phase 1 deployment. backend-engineer will finalize `build_prompt()` template for plaque prose; iOS will render single explanation paragraph (no field list).
+
+## 2026-05-16 — Prod API live with real image (backend-engineer shipped)
+
+**Status: LIVE.** Art-guide-api revision `art-guide-prod-api--0000003` deployed to Azure Container Apps, running at `https://art-guide-prod-api.kindglacier-84ffc0b4.westus3.azurecontainerapps.io`.
+
+**Confirmed embedder:** `google/siglip-base-patch16-224` (D-015, 768-dim, bundled in image, offline mode enabled). Multi-stage Dockerfile, uvicorn 1 worker, bearer auth required, all health endpoints 200.
+
+**Impact for ml-retrieval-engineer:**
+- Can now ingest real data to prod Postgres (10K+ Met catalog records).
+- `/v1/identify` ready to receive live queries.
+- Bootstrap real eval set against prod DB (currently placeholder in D-025).
+- Cold-start latency: first request after scale-to-zero blocks ~10–30s (model load). Subsequent <150 ms. Revisit if eval P99 regresses.
+
+**Next:** Phase 1 critical path requires full Met catalog in prod. See D-028 for prod image details; D-027 for enrichment tier completion.
+
