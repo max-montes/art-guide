@@ -1,6 +1,6 @@
 ---
-updated_at: 2026-05-16T22:13:00Z
-focus_area: Azure prod live; catalog next; iOS integration testing
+updated_at: 2026-05-16T22:54:00Z
+focus_area: Prod catalog live; iOS integration testing; eval bootstrap
 active_issues: []
 ---
 
@@ -8,7 +8,9 @@ active_issues: []
 
 ## Status
 
-**Azure prod stack is LIVE with real image.** Backend-engineer shipped v1 image (art-guide-api:v1) to Azure Container Apps revision art-guide-prod-api--0000003. All core endpoints returning 200. Postgres+pgvector + Key Vault + bearer auth fully operational.
+**🟢 STACK IS FULLY END-TO-END LIVE WITH REAL CATALOG.**
+
+Backend image deployed (D-028) + 100 Met European Paintings seeded in prod Postgres (D-029). End-to-end `/v1/identify` verified: Van Gogh Sunflowers → exact match, score=1.0, latency ~2.9s warm. All Phase 1 infrastructure operational. iOS team can test against live prod with real museum catalog.
 
 **Phase 1 milestones:**
 - API contract v0 ✓
@@ -20,6 +22,7 @@ active_issues: []
 - Production image built & deployed ✓ (D-028)
 - Museum-plaque LLM prompt design locked ✓ (D-026)
 - Enrichment tier (a) backfill complete (D-027)
+- **Prod catalog seeded (100 Met records, full enrichment) ✓ (D-029)**
 
 **Infrastructure now live:**
 - Prod API: `https://art-guide-prod-api.kindglacier-84ffc0b4.westus3.azurecontainerapps.io` (static bearer auth)
@@ -37,10 +40,10 @@ active_issues: []
 
 In priority order:
 
-1. **Ingest Met catalog to prod** (ml-retrieval-engineer): `art-guide-ml ingest met` → prod Postgres (100 initial, then full ~50K set). Verify `/v1/identify` retrieval works end-to-end with real data.
-2. **iOS end-to-end test** (ios-engineer): Create `.xcodeproj`, build + run in Simulator against live prod. Test camera → upload → identify endpoint. Monitor cold-start latency (first request blocks ~10–30s).
-3. **Bootstrap eval** (ml-retrieval-engineer): Load retrieval-v1 dataset, run confidence + grounding evaluators, pin D-025 baseline metrics.
-4. **Monitor cold-start** (backend-engineer + ios-engineer): Gather real latency data; decision in Phase 2 on minReplicas=1 vs. background task warm-up (D-028 operational note).
+1. **iOS end-to-end test** (ios-engineer): Create `.xcodeproj`, build + run in Simulator against live prod. Test camera → upload → identify endpoint with real museum catalog. Monitor cold-start latency (D-028: first request blocks ~10–30s from scale-to-zero).
+2. **Bootstrap eval** (ml-retrieval-engineer): Load retrieval-v1 dataset, run confidence + grounding evaluators against prod catalog, pin D-025 baseline metrics. Verify recall@1/3, status_accuracy, latency p50/p95/p99.
+3. **Scale catalog** (ml-retrieval-engineer): Full Met dataset (~492K) or confirm Phase 1 scope at 100 records. Phase 4 multi-source expansion (Rijksmuseum, etc.) queued for later.
+4. **Monitor cold-start** (backend-engineer + ios-engineer): Gather real latency data from iOS tests; decision in Phase 2 on minReplicas=1 vs. background task warm-up (D-028 operational note).
 
 ## Out of scope Phase 1
 

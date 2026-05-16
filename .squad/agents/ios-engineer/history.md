@@ -30,6 +30,10 @@
 **Known operational issue (backend):**
 - First request after API scale-to-zero blocks ~10–30s (model load). Subsequent <150 ms. May need retry logic or minReplicas=1 in Phase 2.
 
+## Cross-Agent Note — 2026-05-16 (ml-retrieval-engineer)
+
+Prod is now fully end-to-end live (D-029). You can test the iOS app against the prod URL with real Met catalog responses. Try Sunflowers as a known-good smoke test image. Expect ~3s warm response, longer on cold start (D-028 cold-start issue noted; revisit in Phase 2).
+
 ## Next Steps
 
 1. **Create `.xcodeproj`** — Project owner to create new SwiftUI project in Xcode, merge existing source folders

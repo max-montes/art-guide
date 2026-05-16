@@ -36,6 +36,10 @@
 - Full Met catalog ingest to prod (ml-retrieval-engineer scope)
 - Cold-start latency eval vs. D-025 baseline; Phase 2 decision on minReplicas=1 or background task
 
+## Cross-Agent Note — 2026-05-16 (ml-retrieval-engineer)
+
+Prod catalog now seeded (100 European Paintings, D-029). `/identify` verified end-to-end with Sunflowers → score=1.0. Warm latency ~2.9s (retrieval-bound, not API-bound). Cold-start gotcha from D-028 still applies; monitor in iOS testing.
+
 **Known operational issue:**
 - First request after scale-to-zero blocks ~10–30s (image pull + model load). Revisit if eval P99 regresses.
 

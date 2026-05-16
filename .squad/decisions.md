@@ -466,3 +466,31 @@ revision art-guide-prod-api--0000003: healthState=Healthy, provisioningState=Pro
 
 **Owner:** backend-engineer. **Status:** Shipped — revision art-guide-prod-api--0000003 healthy. **Date:** 2026-05-16.
 
+
+## D-029 — Prod catalog seeded from Met; end-to-end `/v1/identify` verified
+
+**Date:** 2026-05-16  
+**Owner:** ml-retrieval-engineer  
+**Status:** Shipped
+
+**Decision:**
+
+Prod Postgres (`art-guide-prod-pg.postgres.database.azure.com`, database `artguide`) has been seeded with 100 Met Open Access records using the existing `art-guide-ml ingest met` CLI with the `--database-url` flag pointing at the Key Vault `database-url` secret. The embedding model is `google/siglip-base-patch16-224` (SigLIP-base, 768-dim, D-015). All seven Wave 1 enrichment columns (D-027) are populated. End-to-end `/v1/identify` verified against the live prod API.
+
+**Details:**
+
+- Records ingested: 100 (inserted=100, updated=0)
+- Skipped: 12 filter-mismatches, 1 broken image URL — both expected
+- Embedding model: SigLIP-base-patch16-224, 768-dim, L2-normalized (D-015)
+- Enrichment columns populated: artist_bio (100/100), credit_line, dimensions, dynasty, object_wikidata_url, date_begin, date_end
+- HNSW index: present (m=16, ef_construction=64, vector_cosine_ops)
+- Smoke test: "Sunflowers" by Vincent van Gogh (met:436524); status=`exact`, score=1.0
+- Cold latency: ~4,200 ms (container warm at time of test; scale-to-zero cold start expected 10–30 s per D-028)
+- Warm latency: ~2,900 ms (retrieval_ms=2016, llm_ms=82)
+- Connection method: `--database-url` flag (Option B); DSN from Key Vault secret `database-url`; `sslmode=require` baked in
+
+**Rationale:**
+
+The Phase 1 critical path requires real catalog data in prod before iOS integration testing can proceed against live infrastructure. 100 records (European Paintings, department 11) mirrors the local corpus and provides sufficient coverage to validate retrieval quality before scaling to the full Met catalog (~50K records).
+
+**Constraint conformance:** D-002 (retrieval-first), D-004 (Met Phase 1), D-006 (single image pipeline), D-012 (no raw images stored), D-015 (SigLIP-base-224), D-027 (Wave 1 enrichment).
