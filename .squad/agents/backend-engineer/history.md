@@ -62,3 +62,7 @@ Prod catalog now seeded (100 European Paintings, D-029). `/identify` verified en
 - Synchronous `warm_embedder()` blocks first request on cold revisions. Document the trade-off in deployment docs; revisit in Phase 2.
 
 See `history-archive.md` for Phase 0 foundation work (endpoint scaffolding, error handling, pipeline wiring, etc.).
+
+## Cross-Agent Note — 2026-05-16 (ios-engineer outcome)
+
+**iOS app build is now green (13 tests passing, zero warnings).** Brady fixed two blockers: (1) stale `.xcodeproj` regenerated via xcodegen, (2) MockAPIClient NSLock → OSAllocatedUnfairLock for async safety. Brady is now testing on simulator against live prod. Watch for any API contract issues he surfaces (e.g., multipart handling, response shape, error codes).

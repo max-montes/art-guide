@@ -55,6 +55,7 @@
 
 - **backend-engineer:** Prod image deployed (D-028); all endpoints healthy; cold-start gotcha D-028 logged
 - **ios-engineer:** Prod now live. Test against real catalog. Sunflowers = known-good smoke test.
+  - **Update (2026-05-16 23:35):** iOS app build is now green (13 tests passing, zero warnings). Brady fixed xcodegen regen + async lock issues and is testing on simulator against live prod. Watch for any retrieval surface issues he surfaces (e.g., confidence thresholds, ambiguous matches, score distribution).
 
 ---
 
