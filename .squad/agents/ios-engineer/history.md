@@ -1,5 +1,33 @@
 # iOS Engineer History (Current)
 
+## Cold-Start Fix — 2026-05-16 (D-028)
+
+**Symptom:** Brady hit "Could not connect to the server" on first `/identify` from real iPhone. Root cause: container scaled to zero, SigLIP load = ~20 s, URLSession.shared default timeouts fired first.
+
+**APIClient location:** `apps/ios/ArtGuide/Networking/APIClient.swift`
+
+**Timeout changes:**
+- `URLSessionConfiguration.timeoutIntervalForRequest = 60` (per-segment inactivity)
+- `URLSessionConfiguration.timeoutIntervalForResource = 90` (total request lifetime)
+- `URLRequest.timeoutInterval = 60` on the `/identify` request (belt-and-suspenders)
+- `APIClient` now owns its own `URLSession` instead of using `.shared`
+
+**Warmup approach chosen: A (onAppear)**
+- `APIClientProtocol.warmup()` added with default no-op extension (MockAPIClient unchanged)
+- `APIClient.warmup()` fires `GET /healthz` with 30 s timeout, `try?` swallows all errors
+- Called from `CaptureView.onAppear` via `Task { await session.client.warmup() }` in `RootView`
+- Warmup failure never blocks identify
+
+**Endpoints.swift:** Added `static let healthz = "/healthz"`
+
+**Build:** BUILD SUCCEEDED, 13/13 tests pass. Committed: `0a62f8b`
+
+**Decision inbox:** `.squad/decisions/inbox/ios-engineer-apiclient-warmup-and-timeouts.md` (promote to D-032)
+
+**Skill:** `.squad/skills/ios-coldstart-tolerance/SKILL.md`
+
+---
+
 ## Current Status — 2026-05-16
 
 **App scaffold complete.** SwiftUI code ready; `.xcodeproj` creation deferred to project owner. All models and views wired per `docs/data-model.md` and `docs/api.md`. Config pointing to live prod API (via `Config.local.xcconfig`).
