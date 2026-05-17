@@ -1,61 +1,24 @@
 # iOS Engineer History (Current)
 
-## 2026-05-16 — Local Query History + TabView (D-034, D-036, D-037)
+## 2026-05-17 — Full Original Image Storage (D-049)
 
-### What changed
+**Features shipped:** `OriginalImageEncoder.swift` (JPEG 2048px / 0.85 quality), `HistoryImageSource.swift` (3-state fallback: original/thumbnail-only/missing), `FullScreenImageView.swift` (tap-to-zoom viewer). SwiftData lightweight migration: added optional `originalImageData: Data?` to `HistoryEntry` (no data wipe, no schema version bump). New files: 5 source + test. Modified: 4 files. Tests: 66/66 passing (+14).
 
-**Files added:**
-- `apps/ios/ArtGuide/Models/HistoryEntry.swift` — `@Model` class (SwiftData)
-- `apps/ios/ArtGuide/Utilities/ThumbnailGenerator.swift` — JPEG thumbnail generation in pixel space
-- `apps/ios/ArtGuide/Views/HistoryView.swift` — history list, row, badge, empty state, swipe-delete
-- `apps/ios/ArtGuide/Views/ResultDetailView.swift` — re-renders stored result via existing `ResultView`
-- `apps/ios/ArtGuideTests/ThumbnailGeneratorTests.swift` — 7 unit tests
-- `apps/ios/ArtGuideTests/HistoryEntryTests.swift` — 6 persistence smoke tests
+**Key architecture:** One `Task.detached` encodes both blobs; fallback logic in `HistoryImageSource` enum, not view. `IdentifiableImage` wrapper (not retroactive UIImage conformance) for `fullScreenCover` safety. Backward-compat: pre-migration entries degrade to thumbnail-only with "Thumbnail only" label.
 
-**Files modified:**
-- `apps/ios/ArtGuide/ArtGuideApp.swift` — `ModelContainer` init + `.modelContainer()` modifier
-- `apps/ios/ArtGuide/Views/RootView.swift` — refactored to `TabView`; old body extracted to `CameraFlowView`; `saveToHistory()` added to `CameraFlowView`
-- `apps/ios/project.yml` — deployment target bumped from 16.0 → 17.0 (D-034; SwiftData requires iOS 17+)
+**Decision:** D-049 (iOS History: Full Original Image Storage) merged from inbox.
 
-### Architecture decisions
+**Constraint conformance:** Hard rule #3 confirmed server-side only. Device-local re-encoded photo permitted per D-036. ✓
 
-**ModelContainer location:** `ArtGuideApp.init()` creates `ModelContainer(for: HistoryEntry.self)`. Fatal error on failure (schema is trivial; a crash here surfaces real data-corruption issues). `.modelContainer(modelContainer)` attached to `WindowGroup` root so every descendant view has `@Environment(\.modelContext)`.
+---
 
-**Tab structure:**
-```
-RootView (TabView)
-├── CameraFlowView (NavigationStack + "ArtGuide" title) [Camera tab]
-└── NavigationStack → HistoryView                       [History tab]
-```
+## 2026-05-16 — History Tab + Error Polish + Cold-Start (D-034, D-036, D-037, D-042, D-043, D-044, D-045)
 
-**Save flow:** After `session.client.identify()` succeeds (any status):
-1. `Task { await saveToHistory(image:response:) }` — fire-and-forget
-2. Thumbnail generation: `Task.detached(priority: .userInitiated) { ThumbnailGenerator.generate(from:) }.value`
-3. `JSONEncoder().encode(response)` → `rawResponseJSON`
-4. `modelContext.insert(HistoryEntry(...))`
-5. Any failure logs + returns; never surfaces to UI
+**Completed:** SwiftData history storage (HistoryEntry, ThumbnailGenerator, HistoryView), TabView refactor (Camera + History tabs), error screen polish (APIError.headline + debugDetail), cold-start tolerance (60/90 s timeouts + /healthz warmup), staged loading messages (3/10/25 s thresholds), XcodeGen pre-commit hook. Deployment target iOS 17.0 (SwiftData required). Tests: 52 → 66 passing. Decisions: D-034, D-036, D-037, D-042, D-043, D-044, D-045 written to inbox.
 
-**Re-rendering:** `ResultDetailView` decodes `rawResponseJSON` with `JSONDecoder` and passes `IdentifyResponse` to `ResultView`. Same view, zero duplication.
+**Learnings:** SwiftData lightweight migration (add optional field, default param, no VersionedSchema); UIGraphicsImageRenderer scale=1 for pixel-perfect sizing; `.fullScreenCover` dismissal via nil-setting only; pre-commit hook pattern for project-generation drift prevention; cold-start message copy avoids "cold-start"/"container" language.
 
-**IdentifyResponse JSON round-trip:** `IdentifyResponse` is `Codable`; stored properties (`requestID`, `match`, `explanation`) encode/decode faithfully. Computed accessors (`status`, `topCandidate`, etc.) reconstruct correctly from the decoded stored properties. Verified in `HistoryEntryTests.test_rawResponseJSON_decodesBackToIdentifyResponse`.
-
-### Gotchas
-
-**SwiftData + Previews:** Use `.modelContainer(for: HistoryEntry.self, inMemory: true)` in all `#Preview` blocks that touch `HistoryView` or any view with `@Environment(\.modelContext)`. Using the default on-disk container in previews can cause crashes in the Xcode preview canvas because multiple preview processes may open the same SQLite file.
-
-**UIGraphicsImageRenderer scale factor:** The renderer defaults to the device's screen scale (e.g., 3× on iPhone 17 Pro). This means point-space `newSize` → 3× pixel output. `ThumbnailGenerator` always sets `format.scale = 1.0` to work in pixel space, ensuring the output is exactly `maxLongEdge` pixels regardless of device scale. Tests that check decoded `UIImage.size` compare against pixel dimensions (scale=1 images: `.size` == pixel size).
-
-**SwiftData OSAllocatedUnfairLock note:** `ModelContext` is `@MainActor`-bound in the app. `saveToHistory()` is marked `@MainActor` and only spawns a detached task for the CPU thumbnail work, hopping back to main for the insert. No secondary contexts or background ModelContexts needed for this workload.
-
-**Deployment target bump (16.0 → 17.0):** Required for SwiftData. No iOS 16-only APIs existed in the codebase; bump was clean. Brady is on a current iPhone. See D-034.
-
-**"Never store raw images" clarification (D-036):** The project hard rule is server-side only. Local device thumbnail caching for the user's own history view is standard iOS UX and is explicitly permitted. Bearer token is never stored in `HistoryEntry`; only the response body (which does not contain it) is persisted.
-
-### Build + test
-
-**Deployment target:** iOS 17.0 (bumped from 16.0)
-**Build:** SUCCEEDED (iPhone 17 Pro Simulator)
-**Tests:** 52/52 passed (41 pre-existing + 7 ThumbnailGeneratorTests + 6 HistoryEntryTests)
+**See:** `history-archive.md` for earlier work (Phase 0 foundation, embedding selection, test discipline, eval bootstrap).
 
 ---
 

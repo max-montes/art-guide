@@ -644,3 +644,209 @@ Added `Microsoft.App/jobs@2023-05-01` resource `art-guide-prod-ingest` to `infra
 Pinned baseline `baseline-2026-05-17T00-54-11Z.json` against prod with 100-record European Paintings catalog. All threshold failures are expected catalog-coverage artifacts (eval dataset uses `met:435xxx`; prod catalog is `met:436xxx` — zero overlap). Key metrics: recall@1=0.000, recall@3=0.000, status_accuracy=0.079, latency p99=3130ms ✅. 3 false-exact cases (conf 0.851–0.926) signal calibration compression in small homogeneous catalog. 7 out_of_catalog cases skipped due to Wikimedia URL 400/404 — dataset needs URL update. Re-run after full 500K ingest completes.
 
 **Constraint conformance:** D-025 (eval protocol), D-006 (catalog over model).
+
+## D-048 — Parallel Met Ingest Job: Sharded Replicas + Met IP-Throttle Reality
+**Date:** 2026-05-17 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+Reconfigured `art-guide-prod-ingest` (D-046) from 1 replica × 6 req/s (~23 hr ETA) to a parallel sharded design targeting 1-2 hr ETA. Met's per-IP soft-throttle made the original 1-2 hr target unreachable; final landed config trades that for a realistic 5-6 hr ETA at the polite-scraper rate while keeping the parallelism, sharding, and bugfix infrastructure in place.
+
+**Code shipped (image `art-guide-api:v4`):**
+
+1. `art-guide-ml ingest met` CLI: new flags `--shard-index {N|auto}`, `--shard-count N`, `--request-delay S`. `auto` resolves the index from `CONTAINER_APP_REPLICA_NAME`'s trailing integer.
+2. `ingest_met_to_db()`: accepts `shard_index`/`shard_count`, applies modulo split (`i % shard_count == shard_index`) to the global candidate id list after `_list_object_ids`. **Bugfix:** `limit=None` or `limit<=0` now means "unbounded" (the previous `if limit <= 0: raise ValueError` was silently aborting D-046 execution `brsioxp` — it status=Unknown'd and added 0 rows in 40 min before being noticed).
+3. `_get_with_retry()`: don't retry permanent 4xx (status 400-499 except 429). Per-record 403/404 used to burn 31 s of exponential backoff each; at 30-50 % 403 rates in low-numbered Met IDs this was 80% throughput loss with no upside.
+
+**Bicep changes (`infra/azure/main.bicep` `ingestJob`):**
+- `parallelism: 4`, `replicaCompletionCount: 4` — under `manualTriggerConfig` (not at the top of `configuration` — that emits BCP037 and the deploy fails with "Unknown properties parallelism, replicaCompletionCount in ContainerAppsJobConfiguration are not supported").
+- `replicaTimeout: 14400` (4 hr per replica).
+- `image: art-guide-api:v4`.
+- `command`: `art-guide-ml ingest met --limit 0 --shard-index auto --shard-count 4 --request-delay 0.15 --batch-commit-size 64`.
+- CPU/memory unchanged (2 vCPU / 4 Gi per replica).
+
+**Three test executions, all manually stopped after observing throttle:**
+
+| Execution | Image | Parallelism | Delay | Behavior |
+| --- | --- | --- | --- | --- |
+| `rz0rgsf` | v3 | 8 | 0.05 s | First 5 min: ~580 ok / ~30% 403. After: 100% 403. Throttled. |
+| `4mrsgi2` | v4 | 8 | 0.05 s | 100% 403 from start (penalty carry-over). |
+| `myz5lc3` | v4 | 4 | 0.15 s | 100% 403 (still in penalty box). |
+
+DB row count unchanged at 100 records from D-029.
+
+**Met API rate-limit reality (worth knowing for any future scraper):**
+- Met returns **403 Forbidden, NOT 429, NOT Retry-After** when its per-IP soft-throttle trips. You cannot read a retry-hint; you must back off blind.
+- Penalty lasts **≥ 40 min** from the burst event in our observed runs.
+- Observed threshold from a single Azure Container Apps egress IP: somewhere between 27 req/s aggregate (myz5lc3 was throttled) and 160 req/s (rz0rgsf tripped it). Below 27 we have no clean data.
+- KQL `Log_s contains "429"` over-counts dramatically (matches `02:45:28,429` microsecond timestamps and Met object IDs like 10429, 24290). Filter on `"HTTP/1.1 429"` or the explicit `"rate limited"` log string instead.
+
+**1-2 hr ETA not achievable from a single egress IP.** Options to get under that bar all violate other constraints or are out-of-scope:
+1. `--department-ids 11,21` (paintings + sculpture only) — cuts the walk 10× but Brady ruled out scoping.
+2. Multiple egress IPs (multi-region) — violates hard rule #6 (one prod).
+3. Pre-staged IDs from Met's `MetObjects.csv` bulk feed — worth considering as a follow-up; still rate-limited per `/objects/{id}` but no wasted requests on non-PD records.
+
+**Operational handoff:** Brady to `az containerapp job start -n art-guide-prod-ingest -g art-guide-prod-rg` after the throttle penalty clears (≥ 1-2 hr after the last burst, i.e. after ~05:30 UTC on 2026-05-17). Expected ETA at the new committed config: 5-6 hr fetch-bound. First DB-visible commit ~10 min in. If 100% 403 returns, the throttle is still active — wait longer or drop to `parallelism: 2 / request-delay: 0.30s` (= ~6.7 req/s aggregate, mirroring the D-046 single-replica baseline rate but with 2× DB concurrency).
+
+**Side-effect to be aware of on next infra deploy:** `api-bearer-token` is declared in Bicep as `PLACEHOLDER-must-be-set-before-live-traffic` (safely leak-proof). Every `az deployment group create --mode Incremental` resets it, breaking the API. The session's recurring fix was: `az containerapp secret set --secrets "api-bearer-token=$(az keyvault secret show --vault-name art-guide-prod-kv --name api-bearer-token --query value -o tsv)"` + revision restart. A long-term fix (out of scope this session) is to `secretRef: 'api-bearer-token'` from KV like `azure-openai-key` already does.
+
+**Constraint conformance:** D-002 (retrieval-first), D-006 (single image pipeline), D-011 (two envs), D-012 (no raw images), D-015 (SigLIP-base-224), D-018 (met ingest pipeline), D-038 (parameterized apiImage + what-if guard — verified passing on every deploy in this session), D-041/D-046 (Container Apps Job pattern).
+
+## D-049 — iOS History: Full Original Image Storage
+**Date:** 2026-05-17 | **Owner:** ios-engineer | **Status:** Active | **Supersedes:** none
+
+### Problem
+
+Brady's History tab previously stored only a ~50 KB thumbnail (`HistoryEntry.thumbnailData`, ≤512 px). Tapping a row re-rendered the structured result, but the actual photo he had taken was gone — only the tiny list-row thumbnail survived. He wanted the original photo viewable from the detail screen, including a full-screen view.
+
+The naïve fix — store the raw camera bytes — would balloon the SwiftData store: iPhone captures are 4032×3024 HEIC/JPEG @ 5–8 MB each. A few hundred history entries would hit 1–2 GB and slow `@Query` materialisation.
+
+### Decision
+
+Add a second, separately encoded image blob to `HistoryEntry` for the detail screen.
+
+**Storage cap:**
+- **Maximum longest edge:** 2048 px (downscale if larger; preserve aspect ratio)
+- **JPEG quality:** 0.85
+- **Target on-disk size:** ~1–2 MB per typical artwork photo
+
+These constants live on `OriginalImageEncoder` (new file at `apps/ios/ArtGuide/Utilities/OriginalImageEncoder.swift`) and are pinned by a unit test (`test_quality_andCap_areTheDocumentedValues`) so silent drift is caught in CI. The thumbnail (~50 KB @ 512 px) is unchanged — it still drives the History list row.
+
+**Schema migration: lightweight, no `VersionedSchema` declared.** Added one optional `Data?` field (`originalImageData`) to the existing `@Model` class. SwiftData's default migration handles additive optional attributes automatically; no `SchemaMigrationPlan` or migration callback is needed for this change. Existing entries simply read back with `originalImageData == nil`. Brady's local SwiftData store is preserved across this change — no wipe required.
+
+**Backward-compat for old entries via `HistoryImageSource.resolve(for:)`:**
+| `originalImageData` | `thumbnailData` | Result |
+| --- | --- | --- |
+| present, non-empty | — | `.original(data)` — full image, tap-to-zoom enabled |
+| nil or empty | present, non-empty | `.thumbnailOnly(data)` — header shows "Thumbnail only" label below the image |
+| nil/empty | nil/empty | `.missing` — placeholder tile, never crashes |
+
+Pre-migration entries degrade gracefully: the user sees the same low-res thumbnail they always had, plus an unambiguous label explaining why it's not sharper.
+
+**Privacy / hard-rule confirmation:** Project hard rule #3 ("Never store raw uploaded images") is a **server-side** constraint — see D-036 for the canonical clarification. Storing a re-encoded version of the photo the user themselves just took, on that user's own device, in SwiftData, for a History UX they control, is explicitly permitted. Nothing about this change touches server-side storage or logging.
+
+**What changed:**
+- **Added:** `OriginalImageEncoder.swift` (JPEG re-encode with 2048 px cap @ 0.85 quality), `HistoryImageSource.swift` (resolution enum `.original`/`.thumbnailOnly`/`.missing`), `FullScreenImageView.swift` (black-backdrop full-screen viewer with close button), `OriginalImageEncoderTests.swift` (7 tests), `HistoryImageSourceTests.swift` (5 tests)
+- **Modified:** `HistoryEntry.swift` (+`originalImageData: Data?`), `ResultDetailView.swift` (pinned `HistoryImageHeader`, tap-to-full-screen via `fullScreenCover`), `RootView.swift` (`CameraFlowView.saveToHistory` encodes both blobs), `HistoryEntryTests.swift` (+2 tests)
+
+**Verification:** `xcodebuild test … iPhone 17 Pro` — **66/66 passed** (was 52; +14 new tests). All pre-existing tests untouched and green.
+
+**Constraint conformance:** Hard rule #3 (no raw server-side images — confirmed scoped to server ✓).
+
+## D-050 — Eval Baseline Pinned: 100-Record Prod Catalog
+**Date:** 2026-05-17 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+The eval harness (45 test cases in `eval/dataset.jsonl`) needs a pinned baseline to detect future regressions. Established ground-truth numbers for the current prod catalog state before scaling to the full 500K corpus.
+
+**Decision:** Run the eval harness against prod with the existing 100-record European Paintings catalog. Pin baseline file `baseline-2026-05-17T00-54-11Z.json` in `services/ml/eval/baselines/`. All threshold failures are **expected and documented** — they are catalog-coverage artifacts, not pipeline regressions.
+
+**Baseline metrics (2026-05-17T00:54:11Z, 100-record catalog):**
+| Metric | Value | Threshold | Pass? |
+|--------|-------|-----------|-------|
+| recall@1 | 0.000 | 0.80 | ❌ |
+| recall@3 | 0.000 | 0.90 | ❌ |
+| status_accuracy | 0.079 | 0.65 | ❌ |
+| latency p50 | 1929 ms | — | — |
+| latency p95 | 2933 ms | — | — |
+| latency p99 | 3130 ms | 5000 ms | ✅ |
+**n_total=45 | n_evaluated=38 | n_skipped=7**
+
+**Root cause of threshold failures: catalog–dataset mismatch.** The 100-record prod catalog spans `met:436523`–`met:436642` (100 Van Gogh–era European Paintings). The eval dataset uses `met:435xxx` artworks (Bruegel, Cézanne, Caravaggio, etc.). **Zero overlap.** Every "exact" recall@1 miss is a coverage miss, not a retrieval failure.
+
+**Key calibration signals:**
+- **False-exact (3 cases):** 3 exact cases returned `status=exact` with the wrong artwork ID (`recall@1=False`, `status_match=True`). These cross the exact confidence threshold (0.851–0.926) because the Van Gogh catalog has paintings whose SigLIP embeddings land near the query. Small-catalog amplification effect; will be diluted by the full 500K ingest.
+- **Out-of-catalog over-confidence (3 evaluated, 0/3 correct):** Van Gogh *Starry Night* (MoMA) → `likely 0.813` (expected `style_only`), Monet *Impression, Sunrise* → `likely 0.788`, Michelangelo *Creation of Adam* → `likely 0.766`. The catalog is too small and homogeneous to produce confident negative signals. With 500K diverse records these artworks will score lower against their true nearest neighbors.
+- **7 skipped cases:** Wikimedia Commons 400/404 errors (thumbnail size policy change). Dataset URLs need updating; flagged for next dataset revision.
+- **Auth errors (3 cases):** Bearer token was being restored during eval start. 3 cases returned HTTP 401.
+
+**Expected post-full-ingest trajectory:**
+- recall@1 should recover toward local baseline (1.0) once eval artworks are indexed
+- false-exact rate should drop — the delta between a true match and a random Van Gogh will widen
+- out_of_catalog `status` should trend toward `style_only` or `no_match` as more diverse artworks act as comparative anchors
+- latency p50 may increase slightly (larger ANN index); watch for > 3000 ms
+
+**Next eval action:** Re-run harness after full-catalog ingest completes (~23 hr from 2026-05-17T00:51Z). Compare against this baseline. Gate on recall@1 ≥ 0.80 before closing the full-catalog task.
+
+**Constraint conformance:** D-025 (eval protocol — baseline pinned with timestamped JSON + MD ✓), D-006 (catalog over model — failures confirm coverage dependency, not model regression ✓).
+
+## D-051 — Container Apps Job for Full Met Catalog Ingest
+**Date:** 2026-05-17 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+The prod catalog seed (D-029) ingested only 100 European Paintings records. The retrieval pipeline's coverage is strictly bounded by catalog size; the embedding model is frozen (D-028). Scaling coverage requires ingesting the full public-domain Met corpus without manual intervention. Met public-domain corpus count (verified 2026-05-16): **501,696 objects**.
+
+**Decision:** Add a `Microsoft.App/jobs` resource (`art-guide-prod-ingest`) to `infra/azure/main.bicep` with `triggerType: Manual`. This enables on-demand full-catalog ingestion runs without running a persistent container.
+
+**Key spec choices:**
+- `replicaTimeout: 7200` (2 hr safety cap; full 500K ingest at 6 req/s ≈ 23 hr, so retries cover partial progress)
+- `replicaRetryLimit: 1` (fail fast on hard errors; transient rate-limit recovery handled inside the ingest CLI)
+- `command: ['art-guide-ml', 'ingest', 'met', '--limit', '0', '--batch-commit-size', '64']` — `--limit 0` means no limit; `--batch-commit-size 64` tuned for Postgres write batching
+- `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` + `HF_HOME=/opt/hf-cache` — required; the container image bakes in SigLIP weights (D-028) and must NOT attempt HuggingFace download at runtime
+- ACR pull via `registries: [{ server: '...azurecr.io', identity: 'system' }]` — uses job's system-assigned managed identity; granted `AcrPull` role via RBAC assignment in same Bicep
+
+**Resources added to Bicep:**
+1. `Microsoft.App/jobs@2023-05-01` — `art-guide-prod-ingest`
+2. `Microsoft.Authorization/roleAssignments` — KV Secrets User for job MI
+3. `Microsoft.Authorization/roleAssignments` — AcrPull for job MI
+4. Output `ingestJobName`
+
+**Execution started:** `art-guide-prod-ingest-brsioxp` at 2026-05-17T00:51:42Z. Status at time of logging: `Unknown` (container initializing).
+
+**Operational notes:**
+- Azure Container Apps Job provisioning may set `provisioningState=Failed` due to transient ARM timeout ("Operation expired") even though the resource exists and is functional. `az containerapp job start` succeeds regardless. Follow-up incremental Bicep deploy reconciles state.
+- Bicep `--mode Incremental` redeploys reset inline secret values to their Bicep-specified literal (e.g. `PLACEHOLDER-must-be-set-before-live-traffic`). After any Bicep deploy: run `az containerapp secret set` to restore real values from KV.
+- Monitor ingest progress via Log Analytics workspace `9825ff17-0e26-4639-bd2f-c576d9d286ed`, filtering by container name `art-guide-prod-ingest-brsioxp`.
+
+**Alternatives not taken:**
+- **Persistent container** (always-on ingest sidecar): wasteful at Azure prices when ingest runs are rare.
+- **Local ingest → push to prod Postgres**: requires stable long-running local network; risk of partial state.
+- **GitHub Actions workflow job**: adds Actions minutes cost; Azure job is self-contained within the existing infra.
+
+**Constraint conformance:** D-006 (catalog over model ✓), D-013 (two environments only — deployed in `prod` env only ✓), D-028 (SigLIP bundled; offline — `HF_HUB_OFFLINE=1` ✓), D-029 (prod ingest pattern — extends, does not replace, prior 100-record seed ✓).
+
+## D-052 — Parallel Met Ingest Job: Sharded Replicas + Met IP-Throttle Reality
+**Date:** 2026-05-17 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+The first attempt at a full Met Open Access ingest (D-051 / execution `art-guide-prod-ingest-brsioxp`, started 2026-05-17T00:51:42Z) was projected at ~23 hours for 501,696 records: a single replica at the polite Met API rate floor (`DEFAULT_REQUEST_DELAY_S=0.15s` ≈ 6 req/s) was the bottleneck. Compute was idle. The Container Apps Job replica had 2 vCPU / 4 Gi but was using ~1 core; the embedder + DB write are not the gating factor — outbound HTTP to `collectionapi.metmuseum.org` is. Brady approved going faster on the **full** 501K dataset (no scoping down to specific Met departments), accepting the temporary 429 / IP-throttle risk. The existing `_get_with_retry` wrapper already absorbs 429s with exponential backoff so an over-aggressive rate produces backoff (slower run) rather than a fatal failure.
+
+**Decision:** Use **Container Apps Jobs native parallelism** to fan out the ingest across 4 replicas (backed off from initial 8), with per-replica modulo work-sharding off the global candidate id list. Lower per-replica `--request-delay` to 0.15 s (polite floor, 6.67 req/s/replica = ~27 req/s aggregate). Each replica self-resolves its shard index from the `CONTAINER_APP_REPLICA_NAME` env var via a new CLI flag (`--shard-index auto`).
+
+**Code shipped (image `art-guide-api:v4`):**
+
+1. `art-guide-ml ingest met` CLI: new flags `--shard-index {N|auto}`, `--shard-count N`, `--request-delay S`. `auto` resolves the index from `CONTAINER_APP_REPLICA_NAME`'s trailing integer.
+2. `ingest_met_to_db()`: accepts `shard_index`/`shard_count`, applies modulo split (`i % shard_count == shard_index`) to the global candidate id list after `_list_object_ids`. **Bugfix:** `limit=None` or `limit<=0` now means "unbounded" (the previous `if limit <= 0: raise ValueError` was silently aborting D-051 execution `brsioxp` — it status=Unknown'd and added 0 rows in 40 min before being noticed).
+3. `_get_with_retry()`: don't retry permanent 4xx (status 400-499 except 429). Per-record 403/404 used to burn 31 s of exponential backoff each; at 30-50% 403 rates in low-numbered Met IDs this was 80% throughput loss with no upside.
+
+**Bicep changes (`infra/azure/main.bicep` `ingestJob`):**
+- `parallelism: 4`, `replicaCompletionCount: 4` — under `manualTriggerConfig` (not at the top of `configuration` — that emits BCP037 and deploy fails with "Unknown properties parallelism, replicaCompletionCount in ContainerAppsJobConfiguration are not supported").
+- `replicaTimeout: 14400` (4 hr per replica).
+- `image: art-guide-api:v4`.
+- `command`: `art-guide-ml ingest met --limit 0 --shard-index auto --shard-count 4 --request-delay 0.15 --batch-commit-size 64`.
+- CPU/memory unchanged (2 vCPU / 4 Gi per replica).
+
+**Three test executions, all manually stopped after observing throttle:**
+| Execution | Image | Parallelism | Delay | Behavior |
+| --- | --- | --- | --- | --- |
+| `rz0rgsf` | v3 | 8 | 0.05 s | First 5 min: ~580 ok / ~30% 403. After: 100% 403. Throttled. |
+| `4mrsgi2` | v4 | 8 | 0.05 s | 100% 403 from start (penalty carry-over). |
+| `myz5lc3` | v4 | 4 | 0.15 s | 100% 403 (still in penalty box). |
+DB row count unchanged at 100 records from D-029.
+
+**Met API rate-limit reality (worth knowing for any future scraper):**
+- Met returns **403 Forbidden, NOT 429, NOT Retry-After** when its per-IP soft-throttle trips. You cannot read a retry-hint; you must back off blind.
+- Penalty lasts **≥ 40 min** from the burst event in our observed runs.
+- Observed threshold from a single Azure Container Apps egress IP: somewhere between 27 req/s aggregate (myz5lc3 was throttled) and 160 req/s (rz0rgsf tripped it). Below 27 we have no clean data.
+- KQL `Log_s contains "429"` over-counts dramatically (matches `02:45:28,429` microsecond timestamps and Met object IDs like 10429, 24290). Filter on `"HTTP/1.1 429"` or the explicit `"rate limited"` log string instead.
+
+**1-2 hr ETA not achievable from a single egress IP.** Options to get under that bar:
+1. `--department-ids 11,21` (paintings + sculpture only) — cuts the walk 10× but Brady ruled out scoping.
+2. Multiple egress IPs (multi-region) — violates hard rule #6 (one prod).
+3. Pre-staged IDs from Met's `MetObjects.csv` bulk feed — worth considering as a follow-up; still rate-limited per `/objects/{id}` but no wasted requests on non-PD records.
+
+**Realistic ETA at the final committed config (parallelism=4, request_delay=0.15s):**
+- Fetch-only ceiling: 501K / 27 req/s = **~5.2 hours** (assuming no further throttle).
+- Plus embed cost for the ~3-10% of records that pass classification filter: marginal (~10-30 min).
+- **Realistic ETA when throttle clears: 5-6 hours.**
+
+**Operational handoff:** Brady to `az containerapp job start -n art-guide-prod-ingest -g art-guide-prod-rg` after the throttle penalty clears (≥ 1-2 hr after the last burst, i.e. after ~05:30 UTC on 2026-05-17). Expected ETA at the new committed config: 5-6 hr fetch-bound. First DB-visible commit ~10 min in. If 100% 403 returns, the throttle is still active — wait longer or drop to `parallelism: 2 / request-delay: 0.30s` (= ~6.7 req/s aggregate, mirroring the D-051 single-replica baseline rate but with 2× DB concurrency).
+
+**Side-effect awareness on next infra deploy:** `api-bearer-token` is declared in Bicep as `PLACEHOLDER-must-be-set-before-live-traffic` (safely leak-proof). Every `az deployment group create --mode Incremental` resets it, breaking the API. The recurring fix: `az containerapp secret set --secrets "api-bearer-token=$(az keyvault secret show --vault-name art-guide-prod-kv --name api-bearer-token --query value -o tsv)"` + revision restart. A long-term fix (out of scope this session) is to `secretRef: 'api-bearer-token'` from KV like `azure-openai-key` already does.
+
+**Constraint conformance:** D-002 (retrieval-first ✓), D-006 (single image pipeline ✓), D-011 (two envs ✓), D-012 (no raw images — bytes still die in `finally:` block per record ✓), D-015 (SigLIP-base-224 ✓), D-018 (met ingest pipeline ✓), D-038 (parameterized apiImage + what-if guard — verified passing on every deploy in this session ✓), D-041/D-051 (Container Apps Job pattern ✓).
