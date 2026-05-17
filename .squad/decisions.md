@@ -1157,3 +1157,76 @@ Neither blocks today's run; both worth small follow-up.
 3. **Cache priming as accidental fix is invisible.** Three prior incarnations did not commit code, but their failed runs created `.pyc` files that unblocked the fourth. The "fix" is not in any diff. Document state-as-fix explicitly so next incarnation doesn't assume their code change is what worked.
 
 **Constraint conformance:** D-015, D-018, D-046, D-051, D-052, D-053, D-054, D-055, D-056, D-057.
+
+## D-059 — v2 dump-based ingest path (Met CSV + AIC api-data Git)
+
+**Date:** 2026-05-17T06:11Z | **Owner:** ml-retrieval-engineer | **Status:** Shipped (186 tests passing, 9 skipped; all pass when model loaded)
+
+**Decision:** Build a **second, parallel ingest path** per source that reads from published static dumps instead of live REST APIs. Both paths produce identical rows; operators choose `ingest met` (API) or `ingest met-dump` (dump).
+
+### Per-source dump source
+
+| Source | Dump | Why |
+| --- | --- | --- |
+| Met | `metmuseum/openaccess` Git LFS CSV (`MetObjects.csv`) | Single 300 MB file, refreshed daily on GitHub. Covers all 501K records. |
+| AIC | `art-institute-of-chicago/api-data` Git repo + S3 tar.bz2 | One JSON file per record; identical shape to the AIC API. |
+| Rijks | (no dump — keep `rijks_db`) | OAI-PMH already returns 50 records + inlined entities per request. |
+
+### Caching
+
+Each adapter writes to `~/.cache/art-guide/` (override via `ART_GUIDE_CACHE_DIR`):
+- Met CSV → `met-objects.csv`, refresh if older than 7 days.
+- AIC repo → `aic-data/`, `git pull --depth=1` if older than 7 days.
+
+### Denylist (applied at dump layer, BEFORE any API/image call)
+
+Both Met and AIC adapters reject records whose classification matches:
+- **Substring:** `ephemera` (case-insensitive).
+- **Exact:** `coins`, `coin`, `books`, `book`, `manuscripts`, `manuscript`.
+
+### Shared embedder upgrades
+
+1. **MPS auto-detect.** `_resolve_device()` returns `mps` on Apple Silicon, `cpu` elsewhere. Override via `ART_GUIDE_EMBED_DEVICE`.
+2. **`embed_batch(images)`** — new method runs N images through SigLIP in a single forward pass. Single-image `embed_bytes` now delegates to `embed_batch([img])[0]`, guaranteeing catalog (batched at ingest) and queries (single image at `/v1/identify`) live in the same vector space.
+3. **Warmup.** A dummy 224×224 forward pass runs at embedder construction so the first real call doesn't pay MPS kernel-JIT cost (~3-5 s on M-series).
+4. **MPS↔CPU agreement test** (`test_mps_and_cpu_embeddings_agree`) asserts MPS and CPU embeddings of the same image have cosine > 0.999. Locks in the invariant that laptop (MPS) and Container Apps (CPU) catalogs are interchangeable.
+
+### Benchmark
+
+50-record synthetic batch, 480×360 JPEGs ~130 KB each, M-series MPS host, SigLIP-base:
+```
+CPU: seq 3.41s (14.7 rec/s); batch=8 2.16s (23.1 rec/s); speedup=1.58x
+MPS: seq 1.43s (35.0 rec/s); batch=8 1.23s (40.6 rec/s); speedup=1.16x
+```
+
+Projection for 200K records: ~110 min image-bound, total <2 hr (async I/O overlaps fetch and embed).
+
+### Why alternatives rejected
+
+1. **Bicep + Container Apps parallel ingest (D-052).** Hit Met's 80 req/s per-IP aggregate cap immediately. Azure egress IP in penalty box (D-053). Laptop is only quick path.
+2. **Custom image-CDN URL pattern.** Met paths include unpublished department code + filename; still need `/objects/{id}` for `primaryImage`.
+3. **Modify `met_db.py` to read CSV.** Rejected: (a) API path is live-sync path (must keep working for daily incremental), (b) CSV branches inside already-large file obscure live path. Two separate adapters sharing `map_met_record` is cleaner.
+4. **AIC's `allArtworks.jsonl` dump.** Omits `description`, `provenance_text`, several `*_titles` lists. Per-file `json/artworks/{id}.json` layout matches API response byte-for-byte; `map_aic_record` works unchanged.
+5. **≥4x batch speedup on MPS.** Bound is real: per-image PIL preprocessing dominates forward pass at small batch sizes. Throughput win comes primarily from MPS itself (2.4x faster sequential than CPU), not batching. Regression test gates on "batch strictly faster than sequential" (1.05x noise floor).
+
+### Files shipped
+
+- New: `services/ml/ml/ingest/met_csv.py` (24 KB)
+- New: `services/ml/ml/ingest/aic_dump.py` (23 KB)
+- New: `services/ml/tests/test_met_csv.py` (11 KB, 35 cases)
+- New: `services/ml/tests/test_aic_dump.py` (9 KB, 26 cases)
+- New: `docs/ingest.md` (operator runbook)
+- New: `.squad/skills/dump-based-ingest/SKILL.md` (reusable pattern)
+- Modified: `services/ml/ml/embeddings.py` (MPS auto-detect, `embed_batch`, warmup, env-var knobs)
+- Modified: `services/ml/tests/test_embeddings.py` (+device, batch, MPS↔CPU, throughput tests; 9 new cases)
+- Modified: `services/ml/ml/cli.py` (+`ingest met-dump`, `ingest aic-dump` subcommands)
+
+**Test status:** 186 passing, 9 skipped (model-loading tests opted out by default for CI speed; all 9 pass when SigLIP loaded). No regressions in v1 adapter tests (`test_met_db_ingest`, `test_aic_db`, `test_rijks_db`). Original v1 adapters (`met_db.py`, `aic_db.py`, `rijks_db.py`) untouched.
+
+**Constraints honored:** D-002 (PD-only), D-009 (CPU-only prod), D-012 (no image bytes on disk), Hard Rule #4 (single image pipeline), Hard Rule #5 (catalog over model), D-015 (SigLIP D=768), D-049 (laptop-first for throttled sources), D-052 (no permanent 4xx retries), D-058 (asyncpg defensive timeouts).
+
+**Open questions (deferred):**
+- Should `description` (AIC, CC-BY-4.0) be promoted to grounded column? Separate coordination with backend-engineer.
+- Should we add `--shard-count` flag for splitting 500K Met run across two laptops? Easy; not needed for Brady's first run.
+
+**Benchmark rationale:** Brady's ask was ~200K curated records in <2 hours on a laptop. API paths alone would take 25 hr (Met) / 33 hr (AIC). Dump path + MPS gets there.
