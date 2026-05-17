@@ -333,6 +333,7 @@ async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
             cache_max_age_days=cache_max_age_days,
             force_refresh_csv=args.force_refresh,
             dry_run=args.dry_run,
+            resume_skip_existing=bool(getattr(args, "resume_skip_existing", False)),
         )
     finally:
         if pool is not None:
@@ -348,6 +349,7 @@ async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
         f"fetched={summary['fetched']}, "
         f"persisted={summary['total_persisted']} "
         f"(inserted={summary['inserted']}, updated={summary['updated']}), "
+        f"skipped_existing={summary['skipped_existing']}, "
         f"skipped_api={summary['skipped_api_error']}, "
         f"skipped_filter={summary['skipped_filter']}, "
         f"skipped_image={summary['skipped_image_error']}, "
@@ -989,6 +991,17 @@ def _build_parser() -> argparse.ArgumentParser:
     met_dump.add_argument(
         "--force-refresh", action="store_true",
         help="Always re-download the CSV regardless of cache age.",
+    )
+    met_dump.add_argument(
+        "--resume-skip-existing",
+        action="store_true",
+        help=(
+            "On startup, query the DB for the set of source_id values already "
+            "present for source='met' and skip records from the CSV whose "
+            "source_id is in that set (before any API fetch / image download). "
+            "Use when restarting an interrupted ACA Job run so the adapter "
+            "adds genuinely new rows instead of re-fetching existing ones."
+        ),
     )
     met_dump.set_defaults(func=_cmd_ingest_met_dump)
 

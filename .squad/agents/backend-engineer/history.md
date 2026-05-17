@@ -55,3 +55,13 @@ az containerapp revision restart --name art-guide-prod-api -g art-guide-prod-rg 
 
 - **Cache priming as accidental fix is invisible.** Three prior failed runs created `.pyc` files that unblocked the fourth. The "fix" is not in any diff. Document state-as-fix explicitly so future incarnations don't assume their code change worked.
 
+- **ACA Met ingest plan (2026-05-17):** Brady approved planning the off-laptop Met ingest path. Key findings:
+  - `art-guide-prod-ingest` ACA Job already exists in Bicep (`services/ml/ml/ingest/met_csv.py` + `met_db.py` are the two paths). The Bicep job currently runs the v1 `met` API path; plan is to switch to `met-dump` v2 CSV path.
+  - v2 CSV dump pre-filters ~50% of 501K rows before any `/objects/{id}` call — reduces throttle exposure and wall time.
+  - `--resume-skip-existing` ported to `met_csv.py` (`ingest_met_csv_to_db()`) in this session. Pattern mirrors D-060 (aic_db / rijks_db). Skip set loaded at startup; all IDs matched against `source='met'` rows already in DB.
+  - No new `Dockerfile.ingest` needed — API image already contains `art-guide-ml` CLI. Job overrides CMD.
+  - Resource sizing: 2 vCPU / 4 GiB (prior OOM at 2 GiB; SigLIP holds ~1.5 GiB on CPU). Single worker, `request_delay=0.015 s`, `--batch-size 4` (CPU-optimal vs. MPS batch=8).
+  - Expected ~$1.10–1.60 per full run, ~3–4 hr wall time.
+  - Brady reviews `docs/met-aca-job.md` before any `az` command runs.
+  - Key files: `docs/met-aca-job.md` (runbook), `services/ml/ml/ingest/met_csv.py` (resume-skip port), `services/ml/ml/cli.py` (flag + summary), `.squad/decisions/inbox/backend-engineer-met-aca-job.md` (D-NNN candidate).
+
