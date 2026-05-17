@@ -231,3 +231,11 @@ or the dump-adapter tests.
   `source_id`.** Used the real column name everywhere in code, comments,
   and CLI `--help` text. Worth double-checking column names against the
   migration before naming a flag from a Slack message.
+
+### 2026-05-17: Overnight AIC + Rijks v1 ingest to natural completion
+- Shipped `--resume-skip-existing` flag for aic_db + rijks_db adapters (commit a13db42, local-only).
+- Pattern: load existing external_ids into Python set at startup; skip AFTER list API (needed for ID discovery) but BEFORE per-record image GET.
+- AIC v1 PD ceiling: ~14,504 records (pages=335, filter rejects 70% via is_public_domain + image checks).
+- Rijks v1 PD ceiling: ~6,590 records (OAI-PMH set 261208, 149 pages).
+- Next coverage unlock: AIC dump adapter using the real S3 tarball (currently walks 10 sample records only).
+- Met remains forbidden on laptop. Coverage growth beyond AIC dump requires off-laptop infra (Container Apps job).

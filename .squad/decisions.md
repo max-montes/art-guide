@@ -1230,3 +1230,16 @@ Projection for 200K records: ~110 min image-bound, total <2 hr (async I/O overla
 - Should we add `--shard-count` flag for splitting 500K Met run across two laptops? Easy; not needed for Brady's first run.
 
 **Benchmark rationale:** Brady's ask was ~200K curated records in <2 hours on a laptop. API paths alone would take 25 hr (Met) / 33 hr (AIC). Dump path + MPS gets there.
+
+### D-060 (2026-05-17): Resume-skip-existing as the v1 ingest restart pattern
+**By:** Brady (via Squad overnight session)
+**What:** v1 ingest adapters (aic_db, rijks_db) now support `--resume-skip-existing`. When set, the adapter loads existing external_ids from the DB for that source into an in-memory set at startup and skips per-record fetches for IDs already present. List API calls still happen (needed to discover IDs); the savings are on per-record image GET + embedding compute.
+**Why:** Without this, restarting an interrupted ingest re-walks every page from the beginning and re-embeds existing records, wasting hours. Overnight run with the flag added 10,099 AIC + 1,662 Rijks rows to natural completion in one shift.
+**Scope:** services/ml/ml/ingest/aic_db.py, rijks_db.py, cli.py. Not yet ported to Met v2 or dump adapters.
+**Commit:** a13db42 (local-only — no git remote configured).
+
+### D-061 (2026-05-17): AIC v1 and Rijks v1 PD catalog ceilings
+**By:** Brady (via Squad overnight session)
+**What:** AIC v1 yields ~14,504 public-domain records via the public API (not the ~81K initially projected — `is_public_domain=true` + image-availability filters cut ~70%). Rijks v1 via OAI-PMH set 261208 yields ~6,590 PD records.
+**Why:** Future ingest planning should treat these as fixed ceilings for the v1 path. To grow coverage, dispatch ML to (a) finish the AIC dump adapter using the S3 tarball, or (b) move large jobs off-laptop (Met via Azure Container Apps job).
+**Impact on Phase 1 ingest:** v1 paths are now exhausted at 21,194 total records (aic=14,504, rijks=6,590, met=100). No further gains from the public API adapters. Next unlock is AIC dump adapter (2.5 GB S3 tarball) or moving large-scale work to Container Apps.

@@ -1,18 +1,22 @@
 ---
-updated_at: 2026-05-17T00:20:00-07:00
-focus_area: Full Met catalog ingest running; eval baseline pinned against 100-record prod catalog
+updated_at: 2026-05-17T07:17:00-07:00
+focus_area: Retrieval index at 21,194 records; v1 API paths exhausted
 active_issues: []
 ---
 
-# What We're Focused On
+# Current focus
+Last updated: 2026-05-17 by Brady
+
+## Where we are
+Retrieval index at 21,194 artworks (aic=14,504, rijks=6,590, met=100). Both AIC v1 and Rijks v1 ingests have hit their natural PD catalog ceilings via the public APIs. Overnight unlock was the `--resume-skip-existing` flag landed in commit a13db42 (see D-060 & D-061 in decisions.md).
+
+## What We're Focused On
 
 ## Status
 
-**🟢 Full-catalog ingest running. 🟢 Eval baseline pinned.**
+**🟢 v1 API ingest complete. 🟢 Resume-skip pattern locked in.**
 
-Full Met catalog ingest (`art-guide-prod-ingest-brsioxp`, D-046) started 2026-05-17T00:51:42Z. 501,696 public-domain Met records. Estimated ~23 hr for completion. Monitor via Azure Portal → Container Apps Jobs → `art-guide-prod-ingest`.
-
-Eval baseline pinned (D-047): `baseline-2026-05-17T00-54-11Z.json`. recall@1=0.000, status_acc=0.079, latency p99=3130ms. All failures are catalog-coverage artifacts (eval artworks not in 100-record prod catalog). Baseline is the regression anchor for post-full-ingest eval re-run.
+AIC v1 + Rijks v1 ran to natural completion overnight with `--resume-skip-existing` flag (D-060). Added 10,099 AIC + 1,662 Rijks records (commit a13db42, local-only). Natural PD ceilings: AIC ~14,504 (70% filtered by `is_public_domain=true` + image checks), Rijks ~6,590 (OAI-PMH set 261208).
 
 iOS history feature (D-034, D-036, D-037) is complete: SwiftData persistence, Camera|History TabView, 52/52 tests pass. Backend API regression (D-038) fixed; prod stack healthy.
 
