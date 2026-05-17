@@ -5,6 +5,8 @@ Usage examples
     art-guide-ml ingest met --limit 100
     art-guide-ml ingest met --limit 5 --dry-run
     art-guide-ml ingest met --limit 200 --jsonl-out data/met/normalized.jsonl
+    art-guide-ml ingest aic --limit 100
+    art-guide-ml ingest aic --limit 0 --request-delay 1.05 --batch-commit-size 64
     art-guide-ml augment --source path/to/img.jpg --artwork-id met:436532 \\
         --out evals/datasets/augmented/ --count 10
     art-guide-ml embed path/to/img.jpg
@@ -26,6 +28,10 @@ from tqdm import tqdm
 
 from ml.ingest.met import MetIngestionAdapter
 from ml.ingest.met_db import DEFAULT_REQUEST_DELAY_S
+from ml.ingest.rijks_db import (
+    DEFAULT_REQUEST_DELAY_S as RIJKS_DEFAULT_REQUEST_DELAY_S,
+    DEFAULT_SET_SPECS as RIJKS_DEFAULT_SET_SPECS,
+)
 from ml.schema import NormalizedArtwork
 
 logger = logging.getLogger("ml.cli")
@@ -89,6 +95,8 @@ async def _ingest_met_to_db(args: argparse.Namespace) -> int:
         ingest_met_to_db,
     )
 
+    # --limit 0 (or unset and using default) means "unlimited" for sharded runs.
+    # The downstream ingest_met_to_db treats None / non-positive as unbounded.
     limit = args.limit if args.limit is not None else 100
     batch_size = args.batch_commit_size or DEFAULT_BATCH_COMMIT_SIZE
     department_ids = (
@@ -97,12 +105,34 @@ async def _ingest_met_to_db(args: argparse.Namespace) -> int:
         else None
     )
 
+    shard_count = max(1, int(args.shard_count or 1))
+    shard_index = _resolve_shard_index(args.shard_index, shard_count)
+    request_delay = (
+        float(args.request_delay)
+        if args.request_delay is not None
+        else DEFAULT_REQUEST_DELAY_S
+    )
+
+    if shard_count > 1:
+        logger.info(
+            "sharded ingest: shard_index=%d shard_count=%d request_delay=%.3fs",
+            shard_index,
+            shard_count,
+            request_delay,
+        )
+
     pool = None
     if not args.dry_run:
         dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
         logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
         try:
-            pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                command_timeout=30,
+                timeout=15,
+            )
         except Exception as exc:  # noqa: BLE001
             print(
                 f"Could not open Postgres pool ({exc!s}). "
@@ -118,6 +148,9 @@ async def _ingest_met_to_db(args: argparse.Namespace) -> int:
             limit=limit,
             batch_commit_size=batch_size,
             department_ids=department_ids,
+            request_delay=request_delay,
+            shard_index=shard_index,
+            shard_count=shard_count,
             dry_run=args.dry_run,
         )
     finally:
@@ -126,8 +159,9 @@ async def _ingest_met_to_db(args: argparse.Namespace) -> int:
 
     summary = stats.as_dict()
     mode = "DRY-RUN" if args.dry_run else "DB"
+    shard_tag = f" shard={shard_index}/{shard_count}" if shard_count > 1 else ""
     print(
-        f"[{mode}] Met ingest done: "
+        f"[{mode}{shard_tag}] Met ingest done: "
         f"candidates={summary['candidate_ids']}, "
         f"fetched={summary['fetched']}, "
         f"persisted={summary['total_persisted']} "
@@ -139,6 +173,219 @@ async def _ingest_met_to_db(args: argparse.Namespace) -> int:
         f"rate_limited={summary['rate_limited_events']}"
     )
     return 0
+
+
+def _cmd_ingest_aic(args: argparse.Namespace) -> int:
+    """Fetch AIC records, embed, and UPSERT into Postgres."""
+    return asyncio.run(_ingest_aic_to_db(args))
+
+
+async def _ingest_aic_to_db(args: argparse.Namespace) -> int:
+    """DB path: listing-walk → preprocess → embed (SigLIP D=768) → UPSERT."""
+    import asyncpg
+
+    from ml.ingest.aic_db import (
+        DEFAULT_BATCH_COMMIT_SIZE as AIC_DEFAULT_BATCH_COMMIT_SIZE,
+        DEFAULT_PAGE_SIZE as AIC_DEFAULT_PAGE_SIZE,
+        DEFAULT_REQUEST_DELAY_S as AIC_DEFAULT_REQUEST_DELAY_S,
+        ingest_aic_to_db,
+    )
+
+    limit = args.limit if args.limit is not None else 100
+    batch_size = args.batch_commit_size or AIC_DEFAULT_BATCH_COMMIT_SIZE
+    page_size = args.page_size or AIC_DEFAULT_PAGE_SIZE
+    start_page = args.start_page or 1
+    request_delay = (
+        float(args.request_delay)
+        if args.request_delay is not None
+        else AIC_DEFAULT_REQUEST_DELAY_S
+    )
+
+    if request_delay < 1.0:
+        logger.warning(
+            "request_delay=%.3fs is below AIC's published 1 req/s cap. "
+            "Expect 429s and IP throttling. Raise to 1.05 to be safe.",
+            request_delay,
+        )
+
+    pool = None
+    if not args.dry_run:
+        dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
+        logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
+        try:
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                command_timeout=30,
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Could not open Postgres pool ({exc!s}). "
+                "Pass --dry-run to skip DB writes, or bring up "
+                "infra/docker-compose.yml first.",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        stats = await ingest_aic_to_db(
+            pool=pool,
+            limit=limit,
+            batch_commit_size=batch_size,
+            request_delay=request_delay,
+            page_size=page_size,
+            start_page=start_page,
+            dry_run=args.dry_run,
+        )
+    finally:
+        if pool is not None:
+            await pool.close()
+
+    summary = stats.as_dict()
+    mode = "DRY-RUN" if args.dry_run else "DB"
+    print(
+        f"[{mode}] AIC ingest done: "
+        f"pages_walked={summary['pages_walked']}, "
+        f"candidates={summary['candidate_ids']}, "
+        f"fetched={summary['fetched']}, "
+        f"persisted={summary['total_persisted']} "
+        f"(inserted={summary['inserted']}, updated={summary['updated']}), "
+        f"skipped_filter={summary['skipped_filter']}, "
+        f"skipped_image={summary['skipped_image_error']}, "
+        f"skipped_embed={summary['skipped_embed_error']}, "
+        f"skipped_db={summary['skipped_db_error']}, "
+        f"rate_limited={summary['rate_limited_events']}"
+    )
+    return 0
+
+
+def _cmd_ingest_rijks(args: argparse.Namespace) -> int:
+    """Fetch Rijks OAI-PMH records, embed, and UPSERT into Postgres."""
+    return asyncio.run(_ingest_rijks_to_db(args))
+
+
+async def _ingest_rijks_to_db(args: argparse.Namespace) -> int:
+    import asyncpg
+
+    from ml.ingest.rijks_db import (
+        DEFAULT_BATCH_COMMIT_SIZE as RIJKS_DEFAULT_BATCH_COMMIT_SIZE,
+        ingest_rijks_to_db,
+    )
+
+    limit = args.limit if args.limit is not None else 0
+    batch_size = args.batch_commit_size or RIJKS_DEFAULT_BATCH_COMMIT_SIZE
+    request_delay = (
+        float(args.request_delay)
+        if args.request_delay is not None
+        else RIJKS_DEFAULT_REQUEST_DELAY_S
+    )
+    set_specs = (
+        tuple(s.strip() for s in args.set_specs.split(",") if s.strip())
+        if args.set_specs
+        else RIJKS_DEFAULT_SET_SPECS
+    )
+
+    pool = None
+    if not args.dry_run:
+        dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
+        logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
+        try:
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                command_timeout=30,
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Could not open Postgres pool ({exc!s}). "
+                "Pass --dry-run to skip DB writes, or bring up "
+                "infra/docker-compose.yml first.",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        stats = await ingest_rijks_to_db(
+            pool=pool,
+            limit=limit,
+            batch_commit_size=batch_size,
+            set_specs=set_specs,
+            request_delay=request_delay,
+            dry_run=args.dry_run,
+        )
+    finally:
+        if pool is not None:
+            await pool.close()
+
+    summary = stats.as_dict()
+    mode = "DRY-RUN" if args.dry_run else "DB"
+    print(
+        f"[{mode}] Rijks ingest done: "
+        f"candidates={summary['candidate_records']}, "
+        f"pages={summary['fetched_pages']}, "
+        f"records={summary['fetched_records']}, "
+        f"persisted={summary['total_persisted']} "
+        f"(inserted={summary['inserted']}, updated={summary['updated']}), "
+        f"skipped_filter={summary['skipped_filter']}, "
+        f"skipped_image={summary['skipped_image_error']}, "
+        f"skipped_embed={summary['skipped_embed_error']}, "
+        f"skipped_db={summary['skipped_db_error']}, "
+        f"rate_limited={summary['rate_limited_events']}"
+    )
+    return 0
+
+
+def _resolve_shard_index(raw: str | None, shard_count: int) -> int:
+    """Resolve --shard-index value.
+
+    Accepts a non-negative integer, or the literal string ``"auto"`` which
+    parses the trailing integer of ``CONTAINER_APP_REPLICA_NAME``. Azure
+    Container Apps Jobs sets that env var to a value like
+    ``art-guide-prod-ingest-brsioxp-bcde-0`` for replica 0. We extract the
+    last ``-N`` chunk and modulo by shard_count to be safe across naming
+    drift.
+    """
+    if raw is None:
+        return 0
+    raw_s = str(raw).strip().lower()
+    if raw_s.isdigit():
+        return int(raw_s) % shard_count
+    if raw_s != "auto":
+        raise ValueError(
+            f"--shard-index must be a non-negative integer or 'auto', got {raw!r}"
+        )
+
+    replica_name = os.environ.get("CONTAINER_APP_REPLICA_NAME", "")
+    if not replica_name:
+        logger.warning(
+            "--shard-index=auto but CONTAINER_APP_REPLICA_NAME is empty; "
+            "defaulting to shard_index=0"
+        )
+        return 0
+    # Walk the segments from the tail for the first all-digits chunk.
+    for chunk in reversed(replica_name.split("-")):
+        if chunk.isdigit():
+            idx = int(chunk) % shard_count
+            logger.info(
+                "auto-resolved shard_index=%d from CONTAINER_APP_REPLICA_NAME=%r",
+                idx,
+                replica_name,
+            )
+            return idx
+    # Fallback: hash the name into a shard so distinct replicas still
+    # disjoint themselves rather than all stampeding shard 0.
+    idx = abs(hash(replica_name)) % shard_count
+    logger.warning(
+        "could not parse numeric replica index from %r; "
+        "falling back to hash-derived shard_index=%d",
+        replica_name,
+        idx,
+    )
+    return idx
 
 
 def _scrub_dsn(dsn: str) -> str:
@@ -164,7 +411,13 @@ async def _run_backfill_met(args: argparse.Namespace) -> int:
     dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
     logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
     try:
-        pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=4)
+        pool = await asyncpg.create_pool(
+            dsn=dsn,
+            min_size=1,
+            max_size=4,
+            command_timeout=30,
+            timeout=15,
+        )
     except Exception as exc:  # noqa: BLE001
         print(
             f"Could not open Postgres pool ({exc!s}). "
@@ -276,7 +529,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ingest
     ingest = sub.add_parser("ingest", help="Run an ingestion adapter.")
-    ingest_sub = ingest.add_subparsers(dest="source", metavar="{met}")
+    ingest_sub = ingest.add_subparsers(dest="source", metavar="{met,rijks,aic}")
 
     met = ingest_sub.add_parser(
         "met", help="Ingest from The Met Open Access collection."
@@ -287,6 +540,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Max number of records to successfully ingest. "
+            "Pass 0 (or omit in a sharded run) for unlimited — process every "
+            "candidate id in the (possibly sharded) list. "
             "Default: 100 for the DB path; unlimited for --jsonl-out."
         ),
     )
@@ -325,6 +580,37 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     met.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help=(
+            "Number of parallel shards across which to partition the "
+            "candidate id list (modulo split). 1 = no sharding (default). "
+            "Used together with --shard-index for Container Apps Jobs "
+            "parallelism > 1."
+        ),
+    )
+    met.add_argument(
+        "--shard-index",
+        type=str,
+        default=None,
+        help=(
+            "This replica's shard index in [0, shard-count). Pass a literal "
+            "integer or the string 'auto' to derive it from the "
+            "CONTAINER_APP_REPLICA_NAME env var (Azure Container Apps Jobs)."
+        ),
+    )
+    met.add_argument(
+        "--request-delay",
+        type=float,
+        default=None,
+        help=(
+            f"Floor (seconds) between successive Met API requests, per replica. "
+            f"Default: {DEFAULT_REQUEST_DELAY_S}. Lower for parallel runs (e.g. "
+            f"0.05 = 20 req/s/replica); raise if you see sustained 429s."
+        ),
+    )
+    met.add_argument(
         "--jsonl-out",
         type=str,
         default=None,
@@ -334,6 +620,117 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     met.set_defaults(func=_cmd_ingest_met)
+
+    # ingest aic
+    aic = ingest_sub.add_parser(
+        "aic", help="Ingest from The Art Institute of Chicago Open Access API."
+    )
+    aic.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Max number of records to successfully ingest. "
+            "Pass 0 for unlimited — walk every page in the listing. "
+            "Default: 100 for the DB path."
+        ),
+    )
+    aic.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run fetch + image download + embed end-to-end but skip DB writes."
+        ),
+    )
+    aic.add_argument(
+        "--database-url",
+        default=None,
+        help="Postgres DSN (default: $DATABASE_URL or local docker-compose stack).",
+    )
+    aic.add_argument(
+        "--batch-commit-size",
+        type=int,
+        default=None,
+        help="Rows per DB transaction (default: 50).",
+    )
+    aic.add_argument(
+        "--request-delay",
+        type=float,
+        default=None,
+        help=(
+            "Floor (seconds) between successive AIC API/image requests. "
+            "Default: 1.05 (~57 req/min, under AIC's published 60 req/min cap). "
+            "Do NOT lower below 1.0 without explicit AIC engineering permission."
+        ),
+    )
+    aic.add_argument(
+        "--page-size",
+        type=int,
+        default=None,
+        help="Records per listing page (default: 100, AIC max).",
+    )
+    aic.add_argument(
+        "--start-page",
+        type=int,
+        default=None,
+        help=(
+            "Listing page to start from (1-based, default: 1). "
+            "Use to resume after a restart; idempotent upsert makes overlap safe."
+        ),
+    )
+    aic.set_defaults(func=_cmd_ingest_aic)
+
+    # ingest rijks
+    rijks = ingest_sub.add_parser(
+        "rijks", help="Ingest from the Rijksmuseum OAI-PMH (EDM) feed."
+    )
+    rijks.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Max number of records to successfully ingest. "
+            "Pass 0 (or omit) for unbounded — process every record in the "
+            "configured sets (~7K candidates; ~5K with images)."
+        ),
+    )
+    rijks.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run fetch + image download + embed end-to-end but skip DB writes.",
+    )
+    rijks.add_argument(
+        "--database-url",
+        default=None,
+        help="Postgres DSN. Defaults to $DATABASE_URL or the local docker-compose stack.",
+    )
+    rijks.add_argument(
+        "--batch-commit-size",
+        type=int,
+        default=None,
+        help="Rows per DB transaction (default: 50).",
+    )
+    rijks.add_argument(
+        "--set-specs",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated Rijks OAI setSpec values to harvest. "
+            f"Default: {','.join(RIJKS_DEFAULT_SET_SPECS)} "
+            "(paintings + sculptures)."
+        ),
+    )
+    rijks.add_argument(
+        "--request-delay",
+        type=float,
+        default=None,
+        help=(
+            f"Floor (seconds) between successive Rijks OAI requests. "
+            f"Default: {RIJKS_DEFAULT_REQUEST_DELAY_S} (~5 req/s). "
+            "Rijks publishes no per-IP rate limit; keep conservative."
+        ),
+    )
+    rijks.set_defaults(func=_cmd_ingest_rijks)
 
     # backfill
     backfill = sub.add_parser(
