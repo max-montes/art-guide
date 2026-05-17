@@ -1,5 +1,62 @@
 # Backend Engineer History (Current)
 
+## Cross-agent note from ml-retrieval-engineer — 2026-05-17 (Path D ingest deploy)
+
+**Recurring bug:** `api-bearer-token` Container App secret resets to
+`PLACEHOLDER-must-be-set-before-live-traffic` on **every** Bicep
+incremental redeploy of `Microsoft.App/containerApps/art-guide-prod-api`.
+This happened again on the 2026-05-17T03:54Z Path D deploy
+(`art-guide-prod-20260517T035459`). Restored manually via:
+
+```bash
+KV_VAL=$(az keyvault secret show --vault-name art-guide-prod-kv --name api-bearer-token --query value -o tsv)
+az containerapp secret set --name art-guide-prod-api -g art-guide-prod-rg --secrets "api-bearer-token=$KV_VAL"
+az containerapp revision restart --name art-guide-prod-api -g art-guide-prod-rg --revision <latest>
+```
+
+**Root cause** (in `infra/azure/main.bicep` ~line 251):
+
+```bicep
+secrets: [
+  { name: 'database-url',      value: dbUrl }
+  { name: 'api-bearer-token',  value: 'PLACEHOLDER-must-be-set-before-live-traffic' }
+  { name: 'azure-openai-key',  value: 'PLACEHOLDER-set-after-aoai-provisioning' }
+]
+```
+
+Bicep `value:` is the source of truth for ACA on every redeploy — `az
+containerapp secret set` mutations get overwritten. KV is unaffected
+(KV is its own resource, Bicep doesn't touch the KV secret value).
+
+**Proper fix (please prioritise this in a future PR):** migrate
+`api-bearer-token` (and `azure-openai-key`) to KV-backed secretRef:
+
+```bicep
+secrets: [
+  { name: 'database-url',      value: dbUrl }   // keep — generated in Bicep
+  {
+    name: 'api-bearer-token'
+    keyVaultUrl: '${kv.properties.vaultUri}secrets/api-bearer-token'
+    identity: 'system'
+  }
+  {
+    name: 'azure-openai-key'
+    keyVaultUrl: '${kv.properties.vaultUri}secrets/azure-openai-key'
+    identity: 'system'
+  }
+]
+```
+
+This makes KV the canonical store and eliminates the reset bug
+permanently. The Container App's system MI already has
+`Key Vault Secrets User` (see `raKvSecretsUser` in same Bicep).
+
+Recurrence count: 3+ (D-046, D-052, Path D 2026-05-17). Each recurrence
+loses ~1-2 min of API downtime and requires a manual revision restart.
+Worth fixing before the next deploy.
+
+---
+
 ## Current Status — 2026-05-16
 
 **Phase 1 on track.** Core `/v1/identify` pipeline live and returning real Met candidates with confidence-aware status. Prod image v1 shipped and healthy on Azure Container Apps (revision art-guide-prod-api--0000003). 
@@ -163,3 +220,62 @@ Added "Cost monitoring" section to `docs/deployment.md` with portal URL, CLI que
 
 iOS deployment target **raised to 17.0** (required for SwiftData local history feature, D-034). Affects any future iOS coordinate work. No backend changes required; iOS handles persistence locally. Server continues to accept uploads from any compatible iOS version; feature is opt-in on device.
 
+## Diagnosis — Met Ingest Parallel Failure — 2026-05-17T03:33Z
+
+Read-only triage of `art-guide-prod-ingest` after ml-retrieval-engineer-1 ran 3 reconfigured executions with zero rows persisted. Full report: `.squad/decisions/inbox/backend-engineer-ingest-diagnosis.md`.
+
+**TL;DR.** Bicep + CLI are correctly wired (parallelism=4, --shard-index auto, --shard-count 4, --request-delay 0.15, image v4). Each execution was killed by the agent ("Job suspended") within 7–34 min after Met IP-blacklisted the Container Apps egress IP and returned 403 to >88% of requests. The IP-ban persists across job restarts, so each retry hits the same wall. DB still at 100 rows (D-029 seed).
+
+**Recommended:** wait ≥60 min cooldown, then revert to parallelism=1 with --request-delay 0.05 (8 h to full catalog) — the proven config.
+
+## Learnings
+
+**Container Apps Jobs parallelism gotchas:**
+
+- **`Status: Stopped` is ambiguous.** It covers both "user-stopped" and "failed". Always inspect `ContainerAppSystemLogs_CL.Reason_s`. `Suspended` = user/API stop; `Failed` = replica retry-limit hit; otherwise look for `OOMKilled`, `Error`, `BackOff`.
+- **Per-execution config is captured at start time.** `az containerapp job execution show --job-execution-name <name>` returns the template snapshot used for that execution, including command + image tag. This is gold for "what was actually deployed when this ran" — much better than guessing from current job spec.
+- **`az containerapp job logs show` only works while pods are alive.** After ~10 min, ACA garbage-collects replicas and you get `ERROR: No replicas found for execution`. Always go to Log Analytics directly for forensics: `ContainerAppConsoleLogs_CL | where ContainerName_s == '<container>' and TimeGenerated between (...)`. Filter on `ContainerGroupName_s` (= replica pod name) to isolate per-replica streams.
+- **`CONTAINER_APP_REPLICA_NAME` has NO trailing ordinal in manual-trigger jobs.** The format is `<job>-<execId>-<5char-random>` (e.g. `art-guide-prod-ingest-myz5lc3-n9gdj`). Any code that does `name.split('-')[-1]` and expects a digit is wrong. There is no first-class shard-index env var; hash-mod fallback collides ~32% on 4 replicas (birthday-style). Either pre-coordinate shards via a Postgres claim table, or accept the loss with parallelism=1.
+
+**Ingest debugging pattern (replicable):**
+
+1. `az containerapp job execution list -n <job> -g <rg> -o table` → enumerate executions + statuses.
+2. `az containerapp job execution show ... --job-execution-name <name>` → snapshot of command/image/env per execution.
+3. `ContainerAppSystemLogs_CL | where JobName_s == '<job>' | project TimeGenerated, ExecutionName_s, ReplicaName_s, Reason_s, Log_s` → high-level lifecycle events (image pull, start, stop, suspend, OOM).
+4. `ContainerAppConsoleLogs_CL | where ContainerName_s == '<container>'` → application stdout/stderr.
+5. **HTTP-status histogram per minute** is the highest-signal aggregation for any HTTP-bound workload:
+   ```kusto
+   ContainerAppConsoleLogs_CL
+   | where TimeGenerated between (...) and ContainerName_s == 'ingest' and Log_s contains 'HTTP/1.1'
+   | summarize ok=countif(Log_s contains '200 OK'),
+               t429=countif(Log_s contains '429'),
+               t403=countif(Log_s contains '403')
+       by bin(TimeGenerated, 1m)
+   ```
+   Flatline of 403s with zero 200s = IP-ban (not rate-limit). 429s with intermittent 200s = rate-limit, recoverable.
+6. **Verify ground truth in the DB** (`SELECT source, COUNT(*) FROM artworks GROUP BY source`) before believing any log narrative — logs can show successful fetches that never made it to persist due to an exception further down the pipeline.
+
+**Met API specifics:**
+
+- `collectionapi.metmuseum.org` rate-limit floor appears to be ~80 req/s sustained but the IP-blacklist threshold is much lower — likely <40 req/s sustained, with cooldown measured in **hours** not minutes.
+- Once blacklisted, the response is 403 with no `Retry-After` header. Exponential backoff does nothing (the ban is sticky). The code's "don't-retry-4xx-non-429" fix is correct — retrying 403s would just refresh the ban timer.
+- Restarting the job while still banned **prolongs the ban**. Cooldown the egress IP (no requests at all) for ≥60 min before retry; verify with a single curl from the same egress IP before kicking the job.
+
+## Cross-Agent Note — 2026-05-17 (ml-retrieval-engineer ingest saga handoff)
+
+**Residential IP throttle pattern (for future ingest strategies):**
+
+During the multi-source ingest scramble (D-053 through D-058), the Met API IP-banned Brady's residential IP while he was running a single-worker laptop ingest from his home Wi-Fi. The ban persisted for ≥1 hour after the agent killed the process, preventing any retry without waiting for the cooldown to clear.
+
+**Operational lessons for future scenarios:**
+1. **Fresh residential IP is not a guaranteed escape hatch.** ISPs rotate IP ranges; Brady's home Wi-Fi IP happened to never been used by this project before, but was still throttled after the async Container Apps IP had triggered the ban (possibly because Met attributes requests to the organization/UA-string, not just the individual IP).
+2. **Two simultaneous senders from different IPs = compounded risk.** Even though each IP individually respects Met's 80 req/s published limit, simultaneous traffic from two different IPs to the same project may trip per-organization aggregate limits.
+3. **Single-egress discipline is non-negotiable for rate-limited sources.** All requests should flow through one IP at a time until the full catalog is ingested. Parallelism is for compute-bound or multi-source workloads, not per-IP-rate-limited sources.
+4. **Cooldown verification protocol:** Before re-running any Met ingest (whether from Azure or a new residential IP), verify recovery with a single `curl https://collectionapi.metmuseum.org/public/collection/v1/objects/1 -i` from the intended egress IP. Expect HTTP 200 with reasonable latency; any 403 means the IP is still in the penalty box — wait longer before retry.
+
+**For next session:** If Met ingest is needed and both Azure egress IP and Brady's residential IP are in cooldown, consider:
+- **Azure Container Apps from a different region** (requires D-013 amendment to multi-region, out of scope v1)
+- **Met's CSV bulk feed** (GitHub `metmuseum/openaccess`, no HTTP calls to `/objects/{id}`, skips IP-ban risk entirely — ml-retrieval-engineer to evaluate)
+- **Delayed start from a clean VPN/proxy IP** (operational workaround, not recommended for production)
+
+**Current status (end of session):** Brady's residential IP in ≥40 min cooldown (last burst 2026-05-17T04:34Z). Azure Container Apps egress IP in ≥60 min cooldown (last burst 2026-05-17T03:20Z). Both expected to clear by ~06:30Z. Rijks laptop ingest (different host: `data.rijksmuseum.nl`) is live and healthy.

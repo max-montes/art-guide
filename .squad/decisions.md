@@ -850,3 +850,310 @@ DB row count unchanged at 100 records from D-029.
 **Side-effect awareness on next infra deploy:** `api-bearer-token` is declared in Bicep as `PLACEHOLDER-must-be-set-before-live-traffic` (safely leak-proof). Every `az deployment group create --mode Incremental` resets it, breaking the API. The recurring fix: `az containerapp secret set --secrets "api-bearer-token=$(az keyvault secret show --vault-name art-guide-prod-kv --name api-bearer-token --query value -o tsv)"` + revision restart. A long-term fix (out of scope this session) is to `secretRef: 'api-bearer-token'` from KV like `azure-openai-key` already does.
 
 **Constraint conformance:** D-002 (retrieval-first ✓), D-006 (single image pipeline ✓), D-011 (two envs ✓), D-012 (no raw images — bytes still die in `finally:` block per record ✓), D-015 (SigLIP-base-224 ✓), D-018 (met ingest pipeline ✓), D-038 (parameterized apiImage + what-if guard — verified passing on every deploy in this session ✓), D-041/D-051 (Container Apps Job pattern ✓).
+
+## D-053 — Ingest Job Diagnosis: Met IP-Throttle Reality + Shard-Index Bug
+
+**Date:** 2026-05-17T03:33Z | **Owner:** backend-engineer | **Status:** Diagnostic Report
+
+The parallel reconfig (D-048/D-052) is not the problem — **the Met API has IP-banned the Container Apps egress IP**, and the ban persists across job restarts. All three reconfigured executions started, the CLI sharded correctly, replicas began calling `collectionapi.metmuseum.org`, and the Met API returned `403 Forbidden` for >88% of requests within ~30 seconds.
+
+**Two real bugs confirmed:**
+
+1. **Met IP-block:** 403 Forbidden (not 429), returning in sustained 3-4K responses/min per replica. Each execution was deliberately killed and re-run with milder config, but Met's per-IP block did not lift — `artworks` table still has only the 100 European Paintings from D-029. Per-minute 403 trajectory proves this is not rate-limiting backoff but per-IP blacklist with ≥40 min cooldown. Single replica at ~27 req/s aggregate still hit the same 403 wall.
+
+2. **`--shard-index auto` fallback bug:** Current ACA replica naming pattern `art-guide-prod-ingest-myz5lc3-n9gdj` has no trailing digit. The code falls back to `abs(hash(replica_name)) % shard_count`, which on execution `myz5lc3` hashed shards to **1, 2, 3, 1** — shard 0 never claimed, shard 1 double-processed. Would waste ~25% throughput even if Met cooperated.
+
+**Minimal fixes (neither is a blocker, both are defense-in-depth):**
+
+- **Cooldown:** do not start another execution for ≥60 min. The restart loop itself prolongs the ban. Verify recovery with `curl https://collectionapi.metmuseum.org/public/collection/v1/objects/436532 -i` from a Container App revision before re-running.
+- **Fix `_resolve_shard_index`:** current fallback cannot guarantee uniform shard distribution. Cheapest patch: accept ~25% efficiency loss, or drop parallelism to 1 until the fix lands.
+- **(optional, defense-in-depth):** Add ceiling on consecutive 403s; bail after 50 consecutive and exit non-zero.
+
+**Recommended path forward (Brady's call):**
+
+- **Path A (preferred):** Wait ≥60 min cooldown, revert to `parallelism: 1`, `request-delay: 0.05s`. Original `brsioxp` run was working — at 20 req/s it was nowhere near Met's threshold. ~7-8 hr wall-clock for full 501K catalog. Zero risk.
+- **Path C:** Staggered: start 1 replica now after cooldown, verify 30 min, then scale to 2 replicas with per-replica 0.10s delay (= ~20 req/s aggregate, same as Path A, finishes faster if Met cooperates).
+- **Path D (laptop):** Brady's residential IP + single worker. Fresh IP, never throttled. 66 req/s under Met's 80 req/s published limit.
+
+**Constraint conformance:** D-002, D-005, D-006, D-009, D-012, D-015, D-018, D-052.
+
+## D-054 — Path D: Single-Worker Met Catalog Ingest (Met's 80 req/s Published Limit)
+
+**Date:** 2026-05-17T03:51Z | **Owner:** ml-retrieval-engineer | **Status:** Deployed, awaiting IP cooldown to clear
+
+Met's official developer page publishes: **"Please limit request rate to 80 requests per second."** Aggregate per egress IP. Azure Container Apps Jobs share a pool egress IP; multiple replicas sum within that per-IP budget. D-048/D-052's parallel design (4-8 replicas × 6-20 req/s = 27-160 req/s aggregate) exceeded this published cap, triggered Met's IP-level soft-throttle: every response flips to 403 Forbidden (no 429 signal, no Retry-After), with multi-hour cooldown before recovery.
+
+**Decision:** Drop parallelism to 1, push from a single sender at **~66 req/s** (well under 80), accept ~2 hr fetch-bound for 501,696 records. Faster than any throttled-parallel run actually achieves once penalty time is included.
+
+**Bicep config** (`art-guide-prod-ingest` in `infra/azure/main.bicep`):
+- `parallelism: 1`, `replicaCompletionCount: 1`
+- `replicaTimeout: 14400` (4 hr, ~2× expected runtime)
+- Command: `art-guide-ml ingest met --limit 0 --request-delay 0.015 --batch-commit-size 64`
+- Image: `art-guide-api:v4` (includes limit=0 bugfix from D-052, don't-retry-non-429-4xx fix)
+- No `--shard-index` / `--shard-count` — single worker means single shard
+
+**Why parallelism was wrong for this workload:**
+1. **Aggregate, not per-replica, is what Met cares about.** Parallelism is for compute-bound or non-rate-limited I/O workloads. Here the constraint is per-IP rate limit, and adding replicas doesn't reduce wall time — it burns extra credits and breaks the constraint.
+2. **No 429 signal means no adaptive backoff.** 403 looks identical to "permanently restricted" — our code correctly doesn't retry non-429 4xx, so throttled IPs now skip every subsequent record fast. Zero inserts for hours.
+3. **Cooldown dominates the budget.** Each throttle event costs ≥40 min unusable IP. Two events in a row is more wall-clock than a single worker's whole 2-hr run.
+
+**Deployment:** Bicep deploy `art-guide-prod-20260517T035459` succeeded 2026-05-17T03:56Z. Passed what-if guard (D-038). api-bearer-token regression recurred (D-046/D-052 issue — reverted to PLACEHOLDER by Bicep, restored from KV, revision restarted). Filed for proper KV secretRef fix.
+
+**Operational handoff:** Wait until ≥04:51 UTC (60 min after 03:51 kickoff of this work) to give Met's IP throttle a clean cooldown from the 03:20 UTC last failed execution. Verify with `curl` first. Then: `az containerapp job start -n art-guide-prod-ingest -g art-guide-prod-rg`. Expected ETA: ~2 hr fetch-bound at 66 req/s.
+
+**Constraint conformance:** D-002, D-011, D-012, D-015, D-018, D-038, D-046.
+
+## D-055 — Pivot to Laptop for Full Met Ingest (Path D)
+
+**Date:** 2026-05-17T04:30Z | **Owner:** ml-retrieval-engineer-3 | **Status:** Handed off
+
+After D-053, the Azure Container Apps egress IP for `art-guide-prod-ingest` is in Met's per-IP throttle penalty box (≥40 min, likely hours, 100% 403 Forbidden). All three test executions (`rz0rgsf`, `4mrsgi2`, `myz5lc3`) confirmed the penalty is still active.
+
+Brady's residential IP has never been used by this project. Running a single-worker ingest at `--request-delay 0.015` ≈ 66 req/s sits comfortably under Met's 80 req/s limit and avoids further inflaming the Azure egress IP's penalty.
+
+**Decision:** Defer the actual ingest run to Brady's laptop. ml-retrieval-engineer-2's Bicep work (Path D) is still good for future Azure runs. Use a runner script checked into .squad/.scratch/:
+
+```bash
+.squad/.scratch/run-laptop-ingest.sh
+```
+
+What it does:
+- Fetch DATABASE_URL from Key Vault (via `az keyvault secret show`)
+- Launch `caffeinate -ims nohup art-guide-ml ingest met --limit 0 --request-delay 0.015 --batch-commit-size 64`
+- `caffeinate`: keep system awake (idle, on AC, prevent sleep)
+- `nohup + disown`: background process survives Terminal exit
+- `PYTHONUNBUFFERED=1`: real-time log visibility
+
+**Critical:** Brady MUST launch from a regular Terminal.app, NOT inside Copilot CLI. Three attempts from inside this agent session all died — likely Copilot CLI's per-turn process-group cleanup signals child PGIDs even with `PPID=1` re-parenting.
+
+**ETA after cold-start:**
+- Cold import (`transformers` no `.pyc` cache): 5-10 min (macOS amfid code-signature verification dominant cost)
+- Steady-state: 60-66 req/s at `--request-delay 0.015`
+- Full 501K catalog: **2-3 hr** after first DB commit (~5-15 min in)
+
+**Monitoring:**
+```bash
+tail -f /Users/maxmontes/Documents/GitHub/art-guide/.squad/.scratch/laptop-ingest-*.log
+grep -c "HTTP 403" .squad/.scratch/laptop-ingest-*.log  # should be near zero on fresh IP
+psql "$DSN" -c "SELECT COUNT(*) FROM artworks WHERE source='met';"
+```
+
+**Graceful cancel:** `kill <PID>` (SIGTERM), or `kill -9` after 30s. Upserts are idempotent; next run picks up where it left.
+
+**Why not keep Azure as fallback:** Two senders from two different IPs to Met simultaneously = combined rate likely > 80 req/s even if each is individually polite. Met's throttle is per-IP, but combined traffic against `/objects/{id}` from one project may still trip aggregate limits. Single-egress discipline > parallel risk.
+
+**Constraint conformance:** D-002, D-006, D-013, D-018, hard rules #3, #4.
+
+## D-056 — Rijksmuseum Adapter (Phases 1+2 shipped; Phase 3 blocked on Met health)
+
+**Date:** 2026-05-17T21:33Z | **Owner:** ml-retrieval-engineer-4 | **Status:** Adapter complete, live ingest blocked
+
+Built and unit-tested a Rijksmuseum ingest adapter (`ml.ingest.rijks_db` + `art-guide-ml ingest rijks` CLI subcommand) targeting the same `artworks` table with `source='rijks'`. Shares the project's `NormalizedArtwork` schema. Phase 3 (live laptop ingest) was NOT performed — Met ingest was in silent-hang state and the Path C constraint says "if Met is unhealthy, do not start Rijks."
+
+**Rijks API: Open + unspecified rate limit**
+- No API key required (OAI-PMH + Search API + Persistent ID resolver are all open)
+- Published rate limit: **None** — adopted conservative **5 req/s** (`request_delay=0.2s`)
+- Image CDN: `https://iiif.micr.io/{shortcode}/full/max/0/default.jpg` — separate host, no auth
+- Licensing: CC0 / Public Domain Mark; "Rijksmuseum Amsterdam" attribution required (captured per row)
+
+**API surface chosen: OAI-PMH + EDM XML**
+- 50 fully-hydrated records per HTTP call
+- All referenced Concept + Agent entities inlined in same XML — no per-entity follow-ups
+- Image URL directly embedded in `<edm:isShownBy>`
+
+**Corpus scope:**
+| setSpec | Set name | Count |
+| `261208` | schilderijen (paintings) | 4,916 |
+| `26126` | beeldhouwwerken (sculptures) | 2,468 |
+| **Total** | paintings + sculpture | ~7,384 |
+
+After no-image filter (~30-40% lack `<edm:isShownBy>`), expected yield: **~5,000 rows**. `--set-specs` CLI flag accepts comma-separated override for future expansion.
+
+**Field mapping highlights vs. Met:**
+| Field | Rijks | vs. Met |
+| `title` | First `dc:title xml:lang="en"`, else `nl` | Same approach |
+| `artist` | Comma-joined creator URIs resolved to EN labels | Met: single string |
+| `medium` | Comma-joined resolved Concepts from URIs (e.g. "oil paint, canvas") | Met: "Oil on canvas" — different word ordering |
+| `dimensions`, `date` | Direct XML + regex year range | Similar |
+| `source_url` | Synthesised `https://www.rijksmuseum.nl/en/collection/{museum_id}` | `<edm:isShownAt>` absent in all samples |
+| `image_url` | `<edm:isShownBy>` IIIF endpoint | Met: `primaryImage`. **30-40% of Rijks records have no image** |
+| `culture`, `period`, `dynasty` | All null for Rijks (no clean structured equivalents) | Met populates these |
+
+**Fields added (stashed in `raw_metadata`, not promoted to columns):**
+- `raw_metadata.rijks.description_en` — interpretive prose on ~50% of records (future column candidate with AIC once pattern is clear)
+- `raw_metadata.rijks.iconclass_codes` — extracted from `dc:subject` (future iconographic enrichment anchor)
+- `raw_metadata.rijks.agent_wikidata_urls` — captured for future artist enrichment
+- `raw_metadata.rijks.set_ids` — set membership URIs (resolvable to human-readable set names via one-time cache)
+
+**Code shipped:**
+- `services/ml/ml/ingest/rijks_db.py` — 734 LOC, all stdlib XML parsing, no `lxml` dep added
+- `services/ml/tests/test_rijks_db.py` — 24 unit tests (year-range parsing, EDM envelope parsing, full mapping)
+- `services/ml/ml/cli.py` — added `ingest rijks` subcommand with `--limit`, `--dry-run`, `--database-url`, `--batch-commit-size`, `--set-specs`, `--request-delay` flags
+- `.squad/skills/museum-ingest-loop/SKILL.md` — updated with Rijks as confirmed source; confidence validated across Met + AIC + Rijks
+- `docs/rijks-ingest-field-audit.md` — full field audit mirroring Met structure
+
+**Tests:** 94 passed (24 rijks + 33 aic + 26 met + 11 imageops). No regressions.
+
+**Phase 3 status: BLOCKED — Met ingest was in silent-hang state**
+
+Did not kick off Rijks ingest per Path C constraint: "If Met hits any throttle issues, DO NOT START Rijks — laptop CPU + network already saturated."
+
+Observed Met ingest state: 0% CPU, only "Opening asyncpg pool" log line, zero DB row growth after 8+ minutes, then process disappeared with no traceback. Two instances exhibited identical symptoms. **Brady needs to triage — see D-057.**
+
+**Hypothesis (for Brady triage):** asyncpg pool creation against Azure Flexible Server is hanging silently. Worth checking:
+- Brady's IP still in Azure Postgres firewall
+- `psql "$DSN" -c '\conninfo'` from same shell connects at all?
+- Add `command_timeout=60` to `asyncpg.create_pool` to fail fast
+
+If Brady decides Met is lost and wants to start Rijks independently (laptop CPU currently 0%), kickoff:
+```bash
+cd services/ml
+nohup .venv/bin/art-guide-ml ingest rijks \
+  --database-url "$(az keyvault secret show --vault-name art-guide-prod-kv --name database-url --query value -o tsv)" \
+  --limit 0 --request-delay 0.2 --batch-commit-size 64 \
+  > ../../.squad/.scratch/laptop-ingest-rijks-2026-05-17.log 2>&1 &
+```
+ETA: ~30-60 min for ~5K rows (image-bound on CPU embedder).
+
+**What Brady needs to do:**
+1. Triage Met hang (two instances confirmed to silently hang at `create_pool`)
+2. Decide on Rijks kickoff (Phases 1+2 shipped; Phase 3 awaits Met triage outcome)
+3. Nothing else — no API keys, no Azure prep required for Rijks
+
+**Forward decisions (not blockers):**
+- Should `description_en` (Rijks + AIC) get promoted to a canonical `description text` column? Backend's call when grounded-LLM prompt finalized.
+- Should we harvest more Rijks sets (190 total, ~1M records) for v1? Probably stay narrow until product validates breadth-vs-depth.
+
+**Constraint conformance:** D-003, D-005, D-007, D-012, D-015, D-016.
+
+## D-057 — AIC (Art Institute of Chicago) Open Access Adapter — multi-source ingest #3
+
+**Date:** 2026-05-17T21:42Z | **Owner:** ml-retrieval-engineer-5 | **Status:** Adapter shipped; Phase 3 ingest blocked on concurrent CPU + memory pressure
+
+Shipped an AIC ingest adapter (`services/ml/ml/ingest/aic_db.py`) mirroring Met + Rijks patterns. Same `NormalizedArtwork` schema, same `(source, source_id)` ON CONFLICT upsert, same D-024 enrichment columns. Source prefix `aic:`.
+
+**AIC API characteristics:**
+| Property | Value |
+| Base URL | `https://api.artic.edu/api/v1` |
+| **Auth** | **None** — anonymous client. Courtesy `AIC-User-Agent` header recommended. |
+| **Rate limit** | **1 req/s** (60 req/min). Docs explicitly: "no parallel scrapers, 1 second between requests." |
+| Public-domain count (verified 2026-05-17) | **61,617** |
+| Listing endpoint | Returns full records when `fields=` passed — no per-id round-trip needed (halves request budget vs. Met) |
+| Image API | IIIF Image API 2.0, `https://www.artic.edu/iiif/2/{image_id}/full/843,/0/default.jpg` (843px for CDN cache hit) |
+| License | CC0 for metadata; `description` is CC-BY-4.0 (captured to `raw_metadata` only, not grounded) |
+
+**Field mapping highlights:**
+| `NormalizedArtwork` field | AIC source | Notes |
+| `artist_bio` (D-024) | `artist_display` | "Claude Monet (French, 1840–1926)" — mirrors Met's `artistDisplayBio` |
+| `dimensions` (D-024) | `dimensions` | identical semantics |
+| `credit_line` (D-024) | `credit_line` | identical semantics |
+| `date_begin` / `date_end` (D-024) | `date_start` / `date_end` (integers, can be negative for BCE) | placeholder 0 normalized to None |
+| `tags` | merge of `department_title`, `artwork_type_title`, `classification_title{_titles}`, `style_title{s}`, `subject_titles`, `place_of_origin` | dedup, order-preserving |
+
+**Classification filter (wider than Met):**
+```python
+_AIC_ACCEPTED_TYPES = frozenset({
+    "Painting", "Sculpture", "Print", "Drawing and Watercolor", "Drawing",
+    "Photograph", "Mixed Media", "Vessel", "Textile", "Furniture",
+    "Costume and Accessories", "Decorative Arts", "Architectural Drawing",
+    "Architecture", "Coin", "Mask", "Book", "Manuscript",
+})
+```
+Met's filter is paintings + sculpture only. Both correct per context — Met's catalog is large and skewed; AIC's strength is exactly what Met filters out.
+
+**Tests:** 33 passed (AIC) + 26 Met (no regressions) = 59 total. Live validation: 62% acceptance rate on 500 PD records (310 passed, 182 non-PD, 1 no-image, 7 wrong-type).
+
+**Phase 3 — Live ingest kicked off 2026-05-17T04:34Z; DIED at T+5 min with 0 rows ingested**
+
+Root cause: **macOS OOM kill under memory pressure**. SigLIP-base load peaks ~3 GB resident per process. Two concurrent `art-guide-ml` processes (Met + AIC) both initializing the embedder on a 31 GB shared-memory M-series Air, atop Brady's browser/Slack/IDE, exceeded available headroom (294 MB unused at peak). macOS killed both Python processes.
+
+**System state at death:**
+- Load Avg: 22.62 (extreme) | CPU: 27% user, 18% sys, 54% idle
+- PhysMem: 31G used, 294M unused
+- Met PID 49204 also died around same time
+
+The AIC adapter code itself is sound — same SigLIP path, same asyncpg path, same model Met uses fine in isolation. Nothing to fix in the adapter.
+
+**Remediation options (operator decision):**
+1. **Stagger kickoffs ≥60 s apart**, verify each past SigLIP-load phase (RSS > 1.5 GB, ≥1 log line) before starting next. Cheapest fix; works for 2-3 sources if Brady closes some apps.
+2. **Share SigLIP weights via mmap'd model files** — code change in `services/ml/ml/embeddings.py`. Non-trivial, out of scope.
+3. **Promote AIC ingest to Container Apps Job** analogous to D-046's Met job. Bicep update, same image/env/RBAC, `replicaTimeout: 86400` (24 hr for ~18.4 hr expected). Long-term right shape. **Recommendation: Option 3.**
+
+**Concurrent-source impact:**
+| Source | Final state | Notes |
+| Met (PID 49204) | DEAD at T+15 min; 0 rows | OOM-killed alongside AIC. Brady chooses: rerun Met alone on laptop, or restart Met's Container Apps Job. |
+| Rijks | Adapter exists but live ingest never kicked off | Same OOM concern if Rijks ever runs concurrent with another SigLIP loader. |
+| AIC (this run) | DEAD at T+5 min; 0 rows | Adapter sound; needs Option 3 (Container Apps Job) for production ingest. |
+
+**Out of scope:**
+1. `description` as grounded column (CC-BY-4.0) — deserves separate decision + backend coordination.
+2. AIC data dumps (`art-institute-of-chicago/api-data` GitHub repo) — worth considering if AIC engineering reaches out. No action until they do.
+3. Container Apps Job for AIC — deferred to backend-engineer follow-up (Bicep + `deploy.sh` change).
+4. Acceptance-set tuning — review `stats.skipped_filter` after first 5K records.
+
+**Constraint conformance:** Hard rules #1, #3, #4, #5, #6. D-024 enrichment columns shared across Met/AIC.
+
+## D-058 — asyncpg Pool Defensive Bound + True Root Cause Diagnosis
+
+**Date:** 2026-05-17T04:50Z | **Owner:** ml-retrieval-engineer-6 | **Status:** Defensive fix shipped (commit `378dcb3`)
+
+**Corrected diagnosis:** The kickoff prompt's hypothesis ("asyncpg default `min_size=10` opens 10 concurrent handshakes; one stalls") was **wrong on both points**. Pool was already `min_size=1, max_size=4` (set prior), and **asyncpg was not the actual hang**.
+
+**Actual root cause:** `from transformers import AutoModel` inside `get_embedder()` stalled for tens of minutes on Brady's laptop because macOS `amfid` (Apple Mobile File Integrity) was re-verifying every `.so`/`.dylib` under `/Library/Frameworks/Python.framework` on first load, with no `.pyc` cache yet. Combined with the fact that `get_embedder()` runs immediately after the "Opening asyncpg pool" log line, the symptom *looked like* a pool hang.
+
+**Evidence:** After cache warm-up from three earlier failed agent attempts:
+```
+21:45:47.542  INFO ml.cli: Opening asyncpg pool against postgresql://...
+21:45:48.981  INFO ml.embeddings: Loading siglip-base-224 from google/siglip-base-patch16-224 on cpu
+21:45:51.966  INFO httpx: HTTP Request: GET .../objects?isPublicDomain=true&hasImages=true 200 OK
+```
+`create_pool` returned in **1.4s** (not hanging), `from transformers` returned in **3s** — both fast because `.pyc` cache and amfid quarantine were warmed.
+
+**Why I shipped the asyncpg timeout fix anyway:**
+`asyncpg.create_pool` without `timeout=` is a footgun. Any future TLS handshake stall against Azure PG Flex will still hang indefinitely with no error. The fix is cheap, no operational downside on healthy network, converts silent hang into 15-second fast-fail with clear stderr. Belongs in the codebase regardless.
+
+**Commit `378dcb3`:**
+```python
+# all 4 sites in services/ml/ml/cli.py (met, aic, rijks, met-backfill)
+pool = await asyncpg.create_pool(
+    dsn=dsn,
+    min_size=1,
+    max_size=4,
+    command_timeout=30,   # any single query stalled >30s → TimeoutError
+    timeout=15,           # any single connect handshake stalled >15s → TimeoutError
+)
+```
+`timeout=15` forwarded as `connect_kwarg` to each `asyncpg.connect()`. `command_timeout=30` is per-command default. **All 129 tests still pass** (suite grew from 94 to 129 across ingest adapter work).
+
+**Live verification of today's runs:**
+| Process | Status | DB rows |
+| Met (foreground 50-probe) | Past create_pool + get_embedder in 4s, made real HTTP requests | n/a |
+| Met (detached PID 58189) | Fetched 501,696 candidate ids, hit **91% 403 rate** from Met API per-IP throttle (Brady's residential IP still in penalty box from earlier burst). **Killed** to stop resetting cooldown clock. | 100 (unchanged) |
+| Rijks (detached PID 58536) | **HEALTHY**. 106 records embedded in ~3 min, **64 committed to DB** (first batch flush). ~0.7 rec/s image-bound. ETA ~2 hr for full ~5K. | 64 → growing |
+| AIC | Not yet started (zombie PID 53812 killed). Recommend kickoff after Rijks comfortably past 1K rows. | 0 |
+
+**Recommended forward path:**
+
+**Met — two options, prefer (1):**
+1. **Azure Container Apps Job.** `az containerapp job start --name art-guide-prod-ingest`. Different egress IP bypasses residential-IP cooldown. Job exists in Bicep (D-051) with correct command + image v4. ETA ~2 hr fetch-bound at 66 req/s. This was the original Path D plan.
+2. **Wait + laptop retry.** No requests from Brady's IP for ≥60 min, then re-launch. Asyncpg fix means future cold-cache laptop still hangs on SigLIP import (separate problem), but asyncpg path now defensive.
+
+**AIC:** Kick off after Rijks ≥1K rows + CPU headroom: `nohup art-guide-ml ingest aic --database-url "$DSN" --limit 0 --request-delay 1.05 --batch-commit-size 64 > .squad/.scratch/ingest-aic.log 2>&1 & disown`.
+
+**SigLIP cold-start (real bug, separate follow-up):**
+- **Option A:** Pre-warm import — add `import transformers` at top of `ml/cli.py` so it happens during entry-point dispatch, not deep in event loop.
+- **Option B:** Move `get_embedder()` outside event loop — hoist to sync portion of CLI handler before any `asyncio` work starts.
+
+Neither blocks today's run; both worth small follow-up.
+
+**Coordination notes:**
+- Killed zombies: PID 49204 (Met, 62 min hung), PID 53812 (AIC, 56 min hung), PID 58189 (Met fresh, 91% 403).
+- Rijks PID 58536 left running; expected ~2 hr to complete ~5K records.
+- Updated `.squad/skills/prod-catalog-ingest/SKILL.md` with asyncpg-timeout pattern AND clear note: real root cause was SigLIP cold-start, not asyncpg — prevents next agent inheriting wrong hypothesis.
+
+**Lessons learned:**
+1. **Symptom adjacency lies.** "Hang at log line X" usually means "hang in call following X" — but that call can be many awaits deep. ml-retrieval-engineer-2/3/4 blamed asyncpg because `create_pool` is lexically next. ml-retrieval-engineer-3 was first to run `sample(1)` and look at actual stack.
+2. **`asyncio` failure modes hide CPU work.** Synchronous import inside async function appears in `ps` as "0% CPU" if kernel blocks on XPC syscall — neither pool wait nor network wait. `sample(1)` / `py-spy dump` is only ground truth.
+3. **Cache priming as accidental fix is invisible.** Three prior incarnations did not commit code, but their failed runs created `.pyc` files that unblocked the fourth. The "fix" is not in any diff. Document state-as-fix explicitly so next incarnation doesn't assume their code change is what worked.
+
+**Constraint conformance:** D-015, D-018, D-046, D-051, D-052, D-053, D-054, D-055, D-056, D-057.
