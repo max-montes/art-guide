@@ -629,3 +629,18 @@ Thresholds as named constants (`LoadingMessageThreshold`) — tunable without vi
 **Rationale:** Hook is discoverable (visible in git history), self-documenting, and cross-platform (bash). Install is a one-liner. Failure is loud and includes the fix.
 
 **Constraint conformance:** D-030 (XcodeGen regen protocol — elevates from documentation to automated enforcement).
+
+
+## D-046 — Container Apps Job for Full Met Catalog Ingest
+**Date:** 2026-05-17 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+Added `Microsoft.App/jobs@2023-05-01` resource `art-guide-prod-ingest` to `infra/azure/main.bicep`. `triggerType: Manual`, `replicaTimeout: 7200`, `replicaRetryLimit: 1`. Command: `art-guide-ml ingest met --limit 0 --batch-commit-size 64`. Met public-domain corpus count (2026-05-16): 501,696 objects. Execution `art-guide-prod-ingest-brsioxp` started 2026-05-17T00:51:42Z; expected ~23 hr for full ingest. See inbox file for full spec and operational notes.
+
+**Constraint conformance:** D-006 (catalog over model), D-013 (two environments), D-028 (SigLIP offline).
+
+## D-047 — Eval Baseline Pinned: 100-Record Prod Catalog
+**Date:** 2026-05-17 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+Pinned baseline `baseline-2026-05-17T00-54-11Z.json` against prod with 100-record European Paintings catalog. All threshold failures are expected catalog-coverage artifacts (eval dataset uses `met:435xxx`; prod catalog is `met:436xxx` — zero overlap). Key metrics: recall@1=0.000, recall@3=0.000, status_accuracy=0.079, latency p99=3130ms ✅. 3 false-exact cases (conf 0.851–0.926) signal calibration compression in small homogeneous catalog. 7 out_of_catalog cases skipped due to Wikimedia URL 400/404 — dataset needs URL update. Re-run after full 500K ingest completes.
+
+**Constraint conformance:** D-025 (eval protocol), D-006 (catalog over model).

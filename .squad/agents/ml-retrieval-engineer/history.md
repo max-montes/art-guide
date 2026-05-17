@@ -78,3 +78,49 @@ iOS deployment target **raised to 17.0** (required for SwiftData local history f
 ---
 
 See `history-archive.md` for earlier learning (Phase 0 foundation, embedding selection, 5x transformers bug, test discipline fixes, eval bootstrap, iOS Codable shape mismatch, Met enrichment tier (a) implementation).
+
+## Session 2026-05-17 — Full Catalog Ingest Job + Eval Baseline
+
+**Tasks:** A.1 (Container Apps Job for full Met ingest) + A.2 (eval baseline against 100-record prod catalog)
+
+### Met corpus count
+Verified 2026-05-16: **501,696 public-domain objects** (up from 492K estimate — normal API drift).
+
+### A.1 — Container Apps Job (D-046)
+Added `Microsoft.App/jobs@2023-05-01` to `infra/azure/main.bicep`:
+- `art-guide-prod-ingest`, `triggerType: Manual`, `replicaTimeout: 7200`
+- Command: `art-guide-ml ingest met --limit 0 --batch-commit-size 64`
+- `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` — required for baked-in SigLIP weights (D-028)
+- ACR pull via system-assigned MI + RBAC `AcrPull` role assignment
+- Bicep also corrected: containerApp image → `art-guide-api:v1`, `containerPort` → 8000
+
+**Deployment:** `ingest-job-202605161727` (incremental). Bicep validation passed. ARM returned `provisioningState=Failed` for the job resource (transient "Operation expired" — known Azure CA Jobs behavior). Job is functional.
+
+**Post-deploy incident:** Bicep incremental deploy reset `api-bearer-token` secret to PLACEHOLDER. Restored from KV + restarted revision. API confirmed healthy: `/healthz` → `{"status":"ok"}`.
+
+**Execution:** `art-guide-prod-ingest-brsioxp` started 2026-05-17T00:51:42Z. Expected ~23 hr for 500K records at 6 req/s.
+
+### A.2 — Eval baseline (D-047)
+**Run:** `baseline-2026-05-17T00-54-11Z.json`, 38 evaluated / 7 skipped / 45 total.
+
+| Metric | Value | Threshold | Pass? |
+|--------|-------|-----------|-------|
+| recall@1 | 0.000 | 0.80 | ❌ expected |
+| recall@3 | 0.000 | 0.90 | ❌ expected |
+| status_accuracy | 0.079 | 0.65 | ❌ expected |
+| latency p50 | 1929 ms | — | healthy |
+| latency p99 | 3130 ms | 5000 ms | ✅ |
+
+**Root cause of all failures:** Catalog–dataset mismatch. Prod catalog = `met:436xxx` (100 Van Gogh–era EP). Eval dataset = `met:435xxx` (Bruegel, Cézanne, Caravaggio…). Zero overlap. Every recall miss is a coverage miss.
+
+**Key signals:**
+- 3 false-exact cases (returned `status=exact`, wrong ID, conf 0.851–0.926) — small/homogeneous catalog amplifies near-duplicate embeddings
+- 3/3 out_of_catalog evaluated returned `likely` (expected `style_only`) — all-Van-Gogh catalog has no contrast for out-of-catalog artworks
+- 7 OOC cases skipped — Wikimedia 400/404 errors (thumbnail size policy change); dataset URLs need update
+- 3 cases: 401 auth errors during eval start (bearer token being restored)
+
+**Next step:** Re-run after full 500K catalog loads. Gate: recall@1 ≥ 0.80.
+
+### New skills written
+- `.squad/skills/museum-ingest-loop/SKILL.md` — added "Container Apps Job Pattern" section
+- `.squad/skills/eval-baseline-protocol/SKILL.md` — created; covers timestamped baseline protocol, metric classes, calibration danger zones

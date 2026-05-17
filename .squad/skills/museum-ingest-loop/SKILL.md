@@ -112,3 +112,72 @@ async def ingest_{source}_to_db(*, pool, limit, embedder=None, dry_run=False):
 - **Pretending `pgvector` reads need the Python adapter at write time.** Text cast is fine for write. Reach for the adapter only when you actually need typed vector results back from queries.
 - **Logging the image URL plus a random hash "for traceability".** Source IDs already give traceability; don't accidentally log enough to reidentify a user-uploaded query image when the same loop is reused on a query path.
 - **Discovering all IDs once and assuming the order is meaningful.** Most museum APIs return the global ID list in arbitrary order. Don't slice; iterate, filter, and stop at `limit`.
+
+## Container Apps Job Pattern (added 2026-05-16)
+
+When the ingest run is too long to drive from a developer's machine (e.g., ~500K records at 6 req/s ≈ 23 hours), promote it to a **Container Apps Job** on the same environment as the API. This avoids building a separate image and keeps the IAM/secrets model consistent.
+
+**Key choices:**
+- **Same image as the API** — do not build a separate ingest image. Override CMD in the job spec to run `art-guide-ml ingest met --limit 0 --batch-commit-size 64` instead of uvicorn.
+- **Trigger type: Manual** — not scheduled. Brady initiates via CLI; no cron risk of double-ingest.
+- **replicaTimeout: 7200** — Azure's provisioning operation timeout (not total job runtime). The actual job runs until completion regardless.
+- **replicaRetryLimit: 1** — no automatic retry on failure; ingest is idempotent so re-run manually.
+- **CPU/memory: 2 vCPU / 4 Gi** — SigLIP model load at runtime (even with `HF_HUB_OFFLINE=1` it needs to deserialize weights) peaks at ~3 Gi.
+- **DATABASE_URL via secretRef** — same secret as the API container. Never inline the DSN.
+- **HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1** — mandatory when SigLIP weights are baked into the image (D-028). Without these, the job will attempt an HuggingFace download on cold start.
+- **System-assigned identity with AcrPull + KV Secrets User** — same RBAC pattern as the API container app. Add as separate `Microsoft.Authorization/roleAssignments` with deterministic `guid(acr.id, ingestJob.id, roleId)` names.
+
+**Bicep resource type:** `Microsoft.App/jobs@2023-05-01`
+
+```bicep
+resource ingestJob 'Microsoft.App/jobs@2023-05-01' = {
+  name: '${prefix}-ingest'
+  location: location
+  tags: tags
+  identity: { type: 'SystemAssigned' }
+  properties: {
+    environmentId: containerAppsEnv.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 7200
+      replicaRetryLimit: 1
+      registries: [{ server: '${acrName}.azurecr.io', identity: 'system' }]
+      secrets: [{ name: 'database-url', value: dbUrl }]
+    }
+    template: {
+      containers: [{
+        name: 'ingest'
+        image: '${acrName}.azurecr.io/art-guide-api:v1'
+        resources: { cpu: json('2'), memory: '4Gi' }
+        command: ['art-guide-ml', 'ingest', 'met', '--limit', '0', '--batch-commit-size', '64']
+        env: [
+          { name: 'DATABASE_URL',         secretRef: 'database-url' }
+          { name: 'ENV',                  value: 'prod' }
+          { name: 'HF_HUB_OFFLINE',       value: '1' }
+          { name: 'TRANSFORMERS_OFFLINE', value: '1' }
+          { name: 'HF_HOME',              value: '/opt/hf-cache' }
+        ]
+      }]
+    }
+  }
+}
+```
+
+**Monitor a job execution:**
+```bash
+# Start
+az containerapp job start -n art-guide-prod-ingest -g art-guide-prod-rg
+
+# List executions
+az containerapp job execution list -n art-guide-prod-ingest -g art-guide-prod-rg -o table
+
+# Stream logs (requires containerapp-helper extension)
+az containerapp job logs show \
+  -n art-guide-prod-ingest -g art-guide-prod-rg \
+  --execution <exec-name> --container ingest --follow
+```
+
+**Transient "Operation expired" failure:** Azure Container Apps Job provisioning can time out on first creation (provisioningState = "Failed") while the job resource itself is usable. If this happens, attempt `az containerapp job start` anyway — the execution will succeed. Then re-deploy Bicep in incremental mode to reconcile state.
+
+**Corpus count (2026-05-16):** Met public-domain objects: **501,696** (URL: `https://collectionapi.metmuseum.org/public/collection/v1/objects?isPublicDomain=true`). This drifts upward as Met adds records. Re-check before each full-catalog run.
+

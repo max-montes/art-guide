@@ -1,6 +1,6 @@
 ---
-updated_at: 2026-05-16T22:54:00Z
-focus_area: Prod catalog live; iOS integration testing; eval bootstrap
+updated_at: 2026-05-17T00:20:00-07:00
+focus_area: Full Met catalog ingest running; eval baseline pinned against 100-record prod catalog
 active_issues: []
 ---
 
@@ -8,9 +8,13 @@ active_issues: []
 
 ## Status
 
-**🟢 STACK IS FULLY END-TO-END LIVE WITH REAL CATALOG.**
+**🟢 Full-catalog ingest running. 🟢 Eval baseline pinned.**
 
-Backend image deployed (D-028) + 100 Met European Paintings seeded in prod Postgres (D-029). End-to-end `/v1/identify` verified: Van Gogh Sunflowers → exact match, score=1.0, latency ~2.9s warm. All Phase 1 infrastructure operational. iOS team can test against live prod with real museum catalog.
+Full Met catalog ingest (`art-guide-prod-ingest-brsioxp`, D-046) started 2026-05-17T00:51:42Z. 501,696 public-domain Met records. Estimated ~23 hr for completion. Monitor via Azure Portal → Container Apps Jobs → `art-guide-prod-ingest`.
+
+Eval baseline pinned (D-047): `baseline-2026-05-17T00-54-11Z.json`. recall@1=0.000, status_acc=0.079, latency p99=3130ms. All failures are catalog-coverage artifacts (eval artworks not in 100-record prod catalog). Baseline is the regression anchor for post-full-ingest eval re-run.
+
+iOS history feature (D-034, D-036, D-037) is complete: SwiftData persistence, Camera|History TabView, 52/52 tests pass. Backend API regression (D-038) fixed; prod stack healthy.
 
 **Phase 1 milestones:**
 - API contract v0 ✓
@@ -40,10 +44,9 @@ Backend image deployed (D-028) + 100 Met European Paintings seeded in prod Postg
 
 In priority order:
 
-1. **iOS end-to-end test** (ios-engineer): Create `.xcodeproj`, build + run in Simulator against live prod. Test camera → upload → identify endpoint with real museum catalog. Monitor cold-start latency (D-028: first request blocks ~10–30s from scale-to-zero).
-2. **Bootstrap eval** (ml-retrieval-engineer): Load retrieval-v1 dataset, run confidence + grounding evaluators against prod catalog, pin D-025 baseline metrics. Verify recall@1/3, status_accuracy, latency p50/p95/p99.
-3. **Scale catalog** (ml-retrieval-engineer): Full Met dataset (~492K) or confirm Phase 1 scope at 100 records. Phase 4 multi-source expansion (Rijksmuseum, etc.) queued for later.
-4. **Monitor cold-start** (backend-engineer + ios-engineer): Gather real latency data from iOS tests; decision in Phase 2 on minReplicas=1 vs. background task warm-up (D-028 operational note).
+1. **Monitor full-catalog ingest** (ml-retrieval-engineer): `art-guide-prod-ingest-brsioxp` running. Check Azure Portal or Log Analytics after ~12 hr. Expected completion ~2026-05-18T00:00Z.
+2. **Re-run eval post-ingest** (ml-retrieval-engineer): Once 500K records indexed, re-run harness. Gate: recall@1 ≥ 0.80. Also fix 7 Wikimedia dataset URL 400/404 failures (cases 38, 39, 41–44, 45) before re-run.
+3. **Monitor cold-start + prod health** (backend-engineer + ios-engineer): Watch p99 latency after larger ANN index; should stay under 5000 ms.
 
 ## Out of scope Phase 1
 

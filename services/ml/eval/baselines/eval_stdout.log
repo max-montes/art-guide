@@ -1,0 +1,33 @@
+Starting eval against prod...
+# Art-Guide Retrieval Eval — 2026-05-17T00-54-11Z
+
+**Result:** ❌ FAIL
+**API:** https://art-guide-prod-api.kindglacier-84ffc0b4.westus3.azurecontainerapps.io
+**Cases:** 38 evaluated, 7 skipped, 45 total
+
+## Metrics
+
+| Metric | Value | Threshold | Status |
+| ------ | ----- | --------- | ------ |
+| recall@1 | 0.000 | 0.8 | ❌ |
+| recall@3 | 0.000 | 0.9 | ❌ |
+| status_accuracy | 0.079 | 0.65 | ❌ |
+| latency_p50_ms | 1928.584 | — | — |
+| latency_p95_ms | 2932.570 | — | — |
+| latency_p99_ms | 3130.461 | 5000 | ✅ |
+
+## Threshold failures
+
+- recall@1 0.000 < threshold 0.8
+- recall@3 0.000 < threshold 0.9
+- status_accuracy 0.079 < threshold 0.65
+
+## By category
+
+**exact** (n=30): recall@1=0.000, recall@3=0.000, status_acc=0.100, p50=1969ms
+**perturbed** (n=5): recall@1=0.000, recall@3=0.000, status_acc=0.000, p50=1779ms
+**out_of_catalog** (n=3): recall@1=—, recall@3=—, status_acc=0.000, p50=1059ms
+
+EXIT=1
+recall_at_1=0.0 recall_at_3=0.0 status_accuracy=0.07894736842105263
+p50=1929ms p95=2933ms
