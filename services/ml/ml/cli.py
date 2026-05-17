@@ -238,6 +238,7 @@ async def _ingest_aic_to_db(args: argparse.Namespace) -> int:
             page_size=page_size,
             start_page=start_page,
             dry_run=args.dry_run,
+            resume_skip_existing=bool(getattr(args, "resume_skip_existing", False)),
         )
     finally:
         if pool is not None:
@@ -253,6 +254,7 @@ async def _ingest_aic_to_db(args: argparse.Namespace) -> int:
         f"persisted={summary['total_persisted']} "
         f"(inserted={summary['inserted']}, updated={summary['updated']}), "
         f"skipped_filter={summary['skipped_filter']}, "
+        f"skipped_existing={summary['skipped_existing']}, "
         f"skipped_image={summary['skipped_image_error']}, "
         f"skipped_embed={summary['skipped_embed_error']}, "
         f"skipped_db={summary['skipped_db_error']}, "
@@ -264,6 +266,183 @@ async def _ingest_aic_to_db(args: argparse.Namespace) -> int:
 def _cmd_ingest_rijks(args: argparse.Namespace) -> int:
     """Fetch Rijks OAI-PMH records, embed, and UPSERT into Postgres."""
     return asyncio.run(_ingest_rijks_to_db(args))
+
+
+# ----------------------------------------------------------------- dump paths
+
+def _cmd_ingest_met_dump(args: argparse.Namespace) -> int:
+    """v2 Met ingest via the metmuseum/openaccess CSV dump."""
+    return asyncio.run(_ingest_met_dump_to_db(args))
+
+
+async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
+    import asyncpg
+
+    from ml.ingest.met_csv import (
+        DEFAULT_CACHE_MAX_AGE_DAYS as MET_CSV_CACHE_MAX_AGE_DAYS,
+        DEFAULT_EMBED_BATCH_SIZE as MET_CSV_DEFAULT_EMBED_BATCH,
+        ingest_met_csv_to_db,
+    )
+    from ml.ingest.met_db import (
+        DEFAULT_BATCH_COMMIT_SIZE as MET_DEFAULT_BATCH_COMMIT_SIZE,
+    )
+
+    limit = args.limit if args.limit is not None else 0
+    batch_commit_size = args.batch_commit_size or MET_DEFAULT_BATCH_COMMIT_SIZE
+    embed_batch_size = args.embed_batch_size or MET_CSV_DEFAULT_EMBED_BATCH
+    cache_max_age_days = (
+        args.cache_max_age_days
+        if args.cache_max_age_days is not None
+        else MET_CSV_CACHE_MAX_AGE_DAYS
+    )
+    request_delay = (
+        float(args.request_delay)
+        if args.request_delay is not None
+        else DEFAULT_REQUEST_DELAY_S
+    )
+
+    pool = None
+    if not args.dry_run:
+        dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
+        logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
+        try:
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                command_timeout=30,
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Could not open Postgres pool ({exc!s}). "
+                "Pass --dry-run to skip DB writes, or bring up "
+                "infra/docker-compose.yml first.",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        stats = await ingest_met_csv_to_db(
+            pool=pool,
+            limit=limit,
+            max_records=args.max_records,
+            batch_commit_size=batch_commit_size,
+            embed_batch_size=embed_batch_size,
+            request_delay=request_delay,
+            cache_max_age_days=cache_max_age_days,
+            force_refresh_csv=args.force_refresh,
+            dry_run=args.dry_run,
+        )
+    finally:
+        if pool is not None:
+            await pool.close()
+
+    summary = stats.as_dict()
+    mode = "DRY-RUN" if args.dry_run else "DB"
+    print(
+        f"[{mode}] Met-dump ingest done: "
+        f"csv_rows={summary['csv_rows_total']}, "
+        f"csv_accepted={summary['csv_rows_accepted']}, "
+        f"csv_skipped={summary['csv_rows_skipped_filter']}, "
+        f"fetched={summary['fetched']}, "
+        f"persisted={summary['total_persisted']} "
+        f"(inserted={summary['inserted']}, updated={summary['updated']}), "
+        f"skipped_api={summary['skipped_api_error']}, "
+        f"skipped_filter={summary['skipped_filter']}, "
+        f"skipped_image={summary['skipped_image_error']}, "
+        f"skipped_embed={summary['skipped_embed_error']}, "
+        f"skipped_db={summary['skipped_db_error']}, "
+        f"rate_limited={summary['rate_limited_events']}"
+    )
+    return 0
+
+
+def _cmd_ingest_aic_dump(args: argparse.Namespace) -> int:
+    """v2 AIC ingest via the art-institute-of-chicago/api-data Git repo."""
+    return asyncio.run(_ingest_aic_dump_to_db(args))
+
+
+async def _ingest_aic_dump_to_db(args: argparse.Namespace) -> int:
+    import asyncpg
+
+    from ml.ingest.aic_db import (
+        DEFAULT_BATCH_COMMIT_SIZE as AIC_DEFAULT_BATCH_COMMIT_SIZE,
+    )
+    from ml.ingest.aic_dump import (
+        DEFAULT_CACHE_MAX_AGE_DAYS as AIC_DUMP_CACHE_MAX_AGE_DAYS,
+        DEFAULT_EMBED_BATCH_SIZE as AIC_DUMP_DEFAULT_EMBED_BATCH,
+        DEFAULT_IMAGE_REQUEST_DELAY_S as AIC_DUMP_DEFAULT_IMG_DELAY,
+        ingest_aic_dump_to_db,
+    )
+
+    limit = args.limit if args.limit is not None else 0
+    batch_commit_size = args.batch_commit_size or AIC_DEFAULT_BATCH_COMMIT_SIZE
+    embed_batch_size = args.embed_batch_size or AIC_DUMP_DEFAULT_EMBED_BATCH
+    cache_max_age_days = (
+        args.cache_max_age_days
+        if args.cache_max_age_days is not None
+        else AIC_DUMP_CACHE_MAX_AGE_DAYS
+    )
+    image_request_delay = (
+        float(args.image_request_delay)
+        if args.image_request_delay is not None
+        else AIC_DUMP_DEFAULT_IMG_DELAY
+    )
+
+    pool = None
+    if not args.dry_run:
+        dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
+        logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
+        try:
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                command_timeout=30,
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Could not open Postgres pool ({exc!s}). "
+                "Pass --dry-run to skip DB writes, or bring up "
+                "infra/docker-compose.yml first.",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        stats = await ingest_aic_dump_to_db(
+            pool=pool,
+            limit=limit,
+            max_records=args.max_records,
+            batch_commit_size=batch_commit_size,
+            embed_batch_size=embed_batch_size,
+            image_request_delay=image_request_delay,
+            cache_max_age_days=cache_max_age_days,
+            force_refresh_repo=args.force_refresh,
+            dry_run=args.dry_run,
+        )
+    finally:
+        if pool is not None:
+            await pool.close()
+
+    summary = stats.as_dict()
+    mode = "DRY-RUN" if args.dry_run else "DB"
+    print(
+        f"[{mode}] AIC-dump ingest done: "
+        f"json_files={summary['json_files_total']}, "
+        f"accepted={summary['json_files_accepted']}, "
+        f"skipped_filter={summary['json_files_skipped_filter']}, "
+        f"parse_errors={summary['json_files_skipped_parse_error']}, "
+        f"persisted={summary['total_persisted']} "
+        f"(inserted={summary['inserted']}, updated={summary['updated']}), "
+        f"skipped_image={summary['skipped_image_error']}, "
+        f"skipped_embed={summary['skipped_embed_error']}, "
+        f"skipped_db={summary['skipped_db_error']}, "
+        f"rate_limited={summary['rate_limited_events']}"
+    )
+    return 0
 
 
 async def _ingest_rijks_to_db(args: argparse.Namespace) -> int:
@@ -316,6 +495,7 @@ async def _ingest_rijks_to_db(args: argparse.Namespace) -> int:
             set_specs=set_specs,
             request_delay=request_delay,
             dry_run=args.dry_run,
+            resume_skip_existing=bool(getattr(args, "resume_skip_existing", False)),
         )
     finally:
         if pool is not None:
@@ -331,6 +511,7 @@ async def _ingest_rijks_to_db(args: argparse.Namespace) -> int:
         f"persisted={summary['total_persisted']} "
         f"(inserted={summary['inserted']}, updated={summary['updated']}), "
         f"skipped_filter={summary['skipped_filter']}, "
+        f"skipped_existing={summary['skipped_existing']}, "
         f"skipped_image={summary['skipped_image_error']}, "
         f"skipped_embed={summary['skipped_embed_error']}, "
         f"skipped_db={summary['skipped_db_error']}, "
@@ -529,7 +710,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ingest
     ingest = sub.add_parser("ingest", help="Run an ingestion adapter.")
-    ingest_sub = ingest.add_subparsers(dest="source", metavar="{met,rijks,aic}")
+    ingest_sub = ingest.add_subparsers(dest="source", metavar="{met,met-dump,rijks,aic,aic-dump}")
 
     met = ingest_sub.add_parser(
         "met", help="Ingest from The Met Open Access collection."
@@ -678,6 +859,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "Use to resume after a restart; idempotent upsert makes overlap safe."
         ),
     )
+    aic.add_argument(
+        "--resume-skip-existing",
+        action="store_true",
+        help=(
+            "On startup, query the DB for the set of source_id values already "
+            "present for source='aic' and skip records from the listing whose "
+            "source_id is in that set (before any image download/embed). "
+            "Use when restarting an interrupted overnight run so the adapter "
+            "adds genuinely new rows instead of re-embedding existing ones."
+        ),
+    )
     aic.set_defaults(func=_cmd_ingest_aic)
 
     # ingest rijks
@@ -730,7 +922,133 @@ def _build_parser() -> argparse.ArgumentParser:
             "Rijks publishes no per-IP rate limit; keep conservative."
         ),
     )
+    rijks.add_argument(
+        "--resume-skip-existing",
+        action="store_true",
+        help=(
+            "On startup, query the DB for the set of source_id values already "
+            "present for source='rijks' and skip records from the OAI listing "
+            "whose source_id is in that set (before any image download/embed). "
+            "Use when restarting an interrupted run."
+        ),
+    )
     rijks.set_defaults(func=_cmd_ingest_rijks)
+
+    # ingest met-dump (v2 CSV-based)
+    met_dump = ingest_sub.add_parser(
+        "met-dump",
+        help=(
+            "v2 Met ingest: read the metmuseum/openaccess CSV from a local "
+            "cache, filter (PD + denylist), then fetch /objects/{id} + image "
+            "for accepted rows. Batched MPS-aware embedding."
+        ),
+    )
+    met_dump.add_argument(
+        "--limit", type=int, default=None,
+        help="Max records to successfully ingest. 0 / omitted = unlimited.",
+    )
+    met_dump.add_argument(
+        "--max-records", type=int, default=None,
+        help=(
+            "Stop reading the CSV after this many ACCEPTED rows (post-filter). "
+            "Use 20 for a smoke run."
+        ),
+    )
+    met_dump.add_argument(
+        "--dry-run", action="store_true",
+        help="Fetch + image download + embed end-to-end; skip DB writes.",
+    )
+    met_dump.add_argument(
+        "--database-url", default=None,
+        help="Postgres DSN (default: $DATABASE_URL or local docker-compose).",
+    )
+    met_dump.add_argument(
+        "--batch-commit-size", type=int, default=None,
+        help="Rows per DB transaction (default: 50).",
+    )
+    met_dump.add_argument(
+        "--batch-size", "--embed-batch-size", dest="embed_batch_size",
+        type=int, default=None,
+        help=(
+            "Number of images per SigLIP forward pass (default: 8, also "
+            "settable via ART_GUIDE_EMBED_BATCH). On Apple Silicon MPS, "
+            "batch=8 is roughly a 4-5x speedup vs. sequential embeds."
+        ),
+    )
+    met_dump.add_argument(
+        "--request-delay", type=float, default=None,
+        help=(
+            f"Floor (seconds) between Met API requests. "
+            f"Default: {DEFAULT_REQUEST_DELAY_S}."
+        ),
+    )
+    met_dump.add_argument(
+        "--cache-max-age-days", type=int, default=None,
+        help="Re-download the CSV if cache is older than this many days (default: 7).",
+    )
+    met_dump.add_argument(
+        "--force-refresh", action="store_true",
+        help="Always re-download the CSV regardless of cache age.",
+    )
+    met_dump.set_defaults(func=_cmd_ingest_met_dump)
+
+    # ingest aic-dump (v2 git-cloned JSON tree)
+    aic_dump = ingest_sub.add_parser(
+        "aic-dump",
+        help=(
+            "v2 AIC ingest: walk the art-institute-of-chicago/api-data JSON "
+            "tree from a local Git clone. Zero AIC API calls; images fetched "
+            "from IIIF CDN. Batched MPS-aware embedding."
+        ),
+    )
+    aic_dump.add_argument(
+        "--limit", type=int, default=None,
+        help="Max records to successfully ingest. 0 / omitted = unlimited.",
+    )
+    aic_dump.add_argument(
+        "--max-records", type=int, default=None,
+        help=(
+            "Stop after this many ACCEPTED records (post-denylist). "
+            "Use 20 for a smoke run."
+        ),
+    )
+    aic_dump.add_argument(
+        "--dry-run", action="store_true",
+        help="Image download + embed end-to-end; skip DB writes.",
+    )
+    aic_dump.add_argument(
+        "--database-url", default=None,
+        help="Postgres DSN (default: $DATABASE_URL or local docker-compose).",
+    )
+    aic_dump.add_argument(
+        "--batch-commit-size", type=int, default=None,
+        help="Rows per DB transaction (default: 50).",
+    )
+    aic_dump.add_argument(
+        "--batch-size", "--embed-batch-size", dest="embed_batch_size",
+        type=int, default=None,
+        help=(
+            "Number of images per SigLIP forward pass (default: 8; also "
+            "settable via ART_GUIDE_EMBED_BATCH)."
+        ),
+    )
+    aic_dump.add_argument(
+        "--image-request-delay", type=float, default=None,
+        help=(
+            "Floor (seconds) between successive IIIF image GETs. "
+            "Default: 0.05 (~20 req/s). The IIIF CDN is not subject to "
+            "AIC's 60 req/min API cap."
+        ),
+    )
+    aic_dump.add_argument(
+        "--cache-max-age-days", type=int, default=None,
+        help="Re-pull the api-data repo if older than this many days (default: 7).",
+    )
+    aic_dump.add_argument(
+        "--force-refresh", action="store_true",
+        help="Always git-pull the api-data repo, regardless of cache age.",
+    )
+    aic_dump.set_defaults(func=_cmd_ingest_aic_dump)
 
     # backfill
     backfill = sub.add_parser(
