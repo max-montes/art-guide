@@ -71,7 +71,56 @@ See `history-archive.md` for Phase 0 foundation work (endpoint scaffolding, erro
 
 **iOS now warms `/healthz` before `/identify` (D-033).** The camera view (RootView) fires a background `GET /healthz` on appear, so the container wakes + model loads while the user is looking at the UI. Combined with raised timeouts (60s per-segment, 90s total), this mitigates the cold-start latency observed in D-028. Expect occasional unprovoked `/healthz` traffic from the app — that's intentional.
 
-## Wave 2 Museum-Plaque Prompt + Cost Controls — 2026-05-16
+## Prod Outage — Bicep Regression + Remediation — 2026-05-17
+
+**Incident (from D-038):** ml-retrieval-engineer's ingest job Bicep deploy regressed the API container to `mcr.microsoft.com/azuredocs/containerapps-helloworld:latest` with port 80. Brady's iOS app received HTML instead of JSON → decode error.
+
+**Root causes:**
+1. `parameters.prod.json` had `containerPort: 80` (hello-world's port, never updated).
+2. `main.bicep` lacked `apiImage` / `apiCpu` / `apiMemory` params — any Bicep redeploy could reset them.
+3. Registry binding (`registries: identity: system`) was wiped by the Bicep redeploy, blocking image pull from ACR.
+
+**Phase 1 remediation (prod restored in ~10 min):**
+```bash
+# 1. Fix ingress port
+az containerapp ingress update -n art-guide-prod-api -g art-guide-prod-rg --target-port 8000
+
+# 2. Restore ACR registry binding (wiped by bad deploy)
+az containerapp registry set -n art-guide-prod-api -g art-guide-prod-rg \
+  --server artguideprodcr.azurecr.io --identity system
+
+# 3. Restore image + sizing + env vars (new revision --0000005)
+az containerapp update -n art-guide-prod-api -g art-guide-prod-rg \
+  --image artguideprodcr.azurecr.io/art-guide-api:v1 \
+  --cpu 1.0 --memory 2.0Gi \
+  --set-env-vars ENV=prod AZURE_KEYVAULT_NAME=art-guide-prod-kv \
+    AZURE_OPENAI_DEPLOYMENT=gpt-5-mini AZURE_OPENAI_API_VERSION=2024-02-01 \
+    DB_POOL_MIN_SIZE=1 DB_POOL_MAX_SIZE=5 PROMPT_LOG_SAMPLE_RATE=1.0 \
+    AZURE_OPENAI_ENDPOINT=https://art-guide-prod-aoai.openai.azure.com/
+```
+Revision --0000005 healthy. `{"status":"ok"}` confirmed. Brady unblocked.
+
+**Phase 2 — Bicep fix (D-038):**
+- Added `param apiImage string`, `param apiCpu string`, `param apiMemory string` to `main.bicep`.
+- Updated `parameters.prod.json`: `containerPort 80 → 8000`, added `apiImage`, `apiCpu`, `apiMemory`.
+- Added `what-if` guard in `deploy.sh` that hard-fails if `containerapps-helloworld` would be deployed.
+- Added warning comment block at top of `main.bicep`.
+- `az deployment group what-if` confirmed 0 API-container changes after fix.
+
+**Phase 3 — Wave 2 prompt shipped (D-036):**
+```bash
+az acr build --registry artguideprodcr --image art-guide-api:v2 \
+  --file services/api/Dockerfile .   # repo root context required (includes services/ml/)
+az containerapp update -n art-guide-prod-api -g art-guide-prod-rg \
+  --image artguideprodcr.azurecr.io/art-guide-api:v2
+```
+Revision --0000006 (v2, museum-plaque curator voice) Healthy. `apiImage` default + `parameters.prod.json` updated to v2.
+
+**Smoke test:** `GET /healthz` → `{"status":"ok"}` from uvicorn (content-type: application/json). 
+
+**Cross-agent note:** ml-retrieval-engineer history updated with incident summary and pointer to D-038.
+
+
 
 **Task A.3 — Wave 2 LLM prompt shipped.**
 

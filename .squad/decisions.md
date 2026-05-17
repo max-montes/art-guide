@@ -549,3 +549,76 @@ The Phase 1 critical path requires real catalog data in prod before iOS integrat
 **Verification:** BUILD SUCCEEDED, 13/13 tests pass. Committed (0a62f8b).
 
 **Constraint conformance:** D-028 (Dockerfile v1 — healthz endpoint), D-007 (API contract — /healthz ops endpoint).
+
+## D-034 — iOS deployment target bumped from 16.0 to 17.0
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Reason:** SwiftData (used for local query history) requires iOS 17+. Brady is on a current iPhone (iOS 17+). No features targeting iOS 16-only APIs exist in the codebase; the bump is safe.
+
+**Changed:** `apps/ios/project.yml` — `deploymentTarget` + `IPHONEOS_DEPLOYMENT_TARGET` on all three targets (`ArtGuide`, `ArtGuideTests`, project-wide settings) changed from `"16.0"` to `"17.0"`. XcodeGen regenerated.
+
+## D-035 — Error UX refinement: headline + debugDetail separation
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** `ErrorView` showed a generic "Couldn't identify that photo" headline for every `APIError` case. The `.decoding` case was embedding raw `NSError` text directly in the user-facing message body in DEBUG builds, making it look like a wall of developer text on Brady's device.
+
+**Decision:**
+1. Added `APIError.headline: String` — per-case user-facing title (see history.md mapping table).
+2. Added `APIError.debugDetail: String?` — raw technical detail extracted from `userFacingMessage`.
+3. `userFacingMessage` is now always clean in all build flavors.
+4. `ErrorView` shows `error.headline` as the title. In `#if DEBUG`, a collapsible `DisclosureGroup("Details")` shows `debugDetail` when non-nil. Release builds: no disclosure.
+
+**Files changed:** `APIError.swift`, `RootView.swift` (ErrorView), `ArtGuideTests/APIErrorTests.swift`.
+
+**Verification:** BUILD SUCCEEDED, 41/41 tests pass.
+
+## D-036 — Local thumbnail caching is permitted for history UX
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Clarification of hard rule #3 ("Never store raw uploaded images"):**
+
+Hard rule #3 is a **server-side constraint**: the backend must not persist the user's uploaded image in logs, blob storage, debug buffers, or anywhere outside the request lifecycle. This is to protect user privacy on shared infrastructure.
+
+It does **not** prohibit a native iOS app from caching the user's own photo on their own device for their own history view. That is standard iOS UX (e.g., all major camera/search apps do this) and does not expose images to any third party.
+
+**What is stored:** A JPEG-compressed thumbnail (~512 px max dimension, ~50 KB) alongside the `/identify` response JSON, in SwiftData on the user's device. This data never leaves the device (no iCloud sync in v1).
+
+**What is NOT stored:** The raw uploaded image, the bearer token, or any server-side log entry containing the image.
+
+## D-037 — Local query history: SwiftData + TabView
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Feature:** Users can review past artwork identifications in a "History" tab.
+
+**Persistence:** SwiftData `@Model class HistoryEntry` (requires iOS 17+, see D-034). `ModelContainer` initialized at app launch in `ArtGuideApp.init()` (fatal error on failure — schema is trivial). Fields: `id`, `timestamp`, `thumbnailData?`, `status`, `topMatchTitle?`, `topMatchArtist?`, `topMatchSourceURL?`, `rawResponseJSON`.
+
+**Save flow:** After every successful `/identify` (any status, including `no_match`), `CameraFlowView.saveToHistory()` runs: thumbnail generation on a detached background task, response JSON encoded with `JSONEncoder`, `HistoryEntry` inserted in `modelContext`. Errors log and drop silently — never block the result screen.
+
+**Tab structure:** `RootView` is now a `TabView` with:
+- Camera tab: `CameraFlowView` (extracted from old `RootView`) with `NavigationStack` + `"ArtGuide"` title
+- History tab: `HistoryView` wrapped in `NavigationStack`
+- Default: Camera tab
+
+**Re-rendering:** `ResultDetailView` decodes `rawResponseJSON` → `IdentifyResponse` → passes to `ResultView`. Zero code duplication.
+
+**Out of scope for this session (future work):** search/filter, sharing, iCloud sync, size cap/eviction, bulk delete, re-querying from history entry, backfill for existing users.
+
+**New files:** `Models/HistoryEntry.swift`, `Utilities/ThumbnailGenerator.swift`, `Views/HistoryView.swift`, `Views/ResultDetailView.swift`. Modified: `ArtGuideApp.swift`, `Views/RootView.swift`, `project.yml`.
+
+**Tests added:** `ThumbnailGeneratorTests.swift` (7 tests), `HistoryEntryTests.swift` (6 tests).
+
+**Verification:** BUILD SUCCEEDED, 52/52 tests pass (41 pre-existing + 13 new).
+
+## D-038 — Bicep API container must use parameterized image (no placeholder defaults)
+**Date:** 2026-05-17 | **Owner:** backend-engineer | **Status:** Active
+
+**Trigger:** Prod outage — ml-retrieval-engineer's ingest job Bicep deploy regressed the API container to `mcr.microsoft.com/azuredocs/containerapps-helloworld:latest` with port 80. iOS app broke with HTML decode error.
+
+**Root causes:**
+1. `parameters.prod.json` had `containerPort: 80` (old bootstrap value, never updated).
+2. `main.bicep` had no `apiImage` param — any redeploy could reset the image if the Bicep default was wrong.
+3. Registry binding (`registries: identity: system`) wiped by Bicep redeploy.
+
+**Decision:** `main.bicep` must expose `apiImage`, `apiCpu`, `apiMemory`, `containerPort` as params with live-prod-matching defaults. `parameters.prod.json` must explicitly set all four. `deploy.sh` must run `what-if` before every deploy and hard-fail if it would write a hello-world/placeholder image. See `.squad/decisions/inbox/backend-engineer-bicep-image-param.md` for full detail.
+
+**Current live state:** revision `art-guide-prod-api--0000006`, image `artguideprodcr.azurecr.io/art-guide-api:v2` (Wave 2 museum-plaque prompt, D-036 shipped).

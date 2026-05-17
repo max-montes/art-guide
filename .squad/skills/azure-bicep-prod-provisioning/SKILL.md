@@ -1,7 +1,7 @@
 # Skill: Azure Bicep Prod Provisioning (Phased, Cost-Gated)
 
-**Confidence:** Low (first time through this exact pattern)  
-**Captured:** 2026-05-10  
+**Confidence:** High (burned twice — D-038 codified the hard lessons)  
+**Captured:** 2026-05-10 | **Last updated:** 2026-05-17  
 **Agent:** backend-engineer
 
 ---
@@ -93,3 +93,58 @@ at resource group scope, with a thin `deploy.sh` wrapper that:
 5. **Container App FQDN:** Available as
    `containerApp.properties.configuration.ingress.fqdn` in Bicep outputs.
    Format: `{appname}.{envhash}.{region}.azurecontainerapps.io`
+
+---
+
+## ⚠️ Critical lessons from D-038 prod outage (2026-05-17)
+
+**Confidence:** High (burned by this twice in one week)
+
+### NEVER hardcode a placeholder image as the API container default
+
+The initial "Phase 3 (placeholder image)" pattern left
+`mcr.microsoft.com/azuredocs/containerapps-helloworld:latest` as the image.
+When another agent re-deployed the Bicep to add a new resource, the default won —
+resetting the live API to hello-world. Brady's iOS app broke immediately.
+
+**Rule:** Always parameterize `apiImage` (and `apiCpu`, `apiMemory`) with defaults
+that match the *current live prod image*, never a sample image. Also pin them
+explicitly in `parameters.prod.json`.
+
+### Always run `what-if` before `az deployment group create`
+
+`az deployment group what-if` catches unintended regressions before they hit prod.
+Add a guard in `deploy.sh` that fails if the API container image would change to
+something unexpected. Expression-drift (principalId as reference expression vs
+hardcoded value) is safe to ignore — it does not cause actual resource changes.
+
+### The registry binding can be wiped by a Bicep redeploy
+
+If `properties.configuration.registries` is absent from the Bicep template at
+deploy time, ACA removes the existing ACR binding. The MI remains but image pull
+fails with UNAUTHORIZED. Keep `registries: [{server: '...', identity: 'system'}]`
+in the template at all times.
+
+### `az acr build` requires the repo root as context (not `services/api/`)
+
+The Dockerfile COPYs from both `services/api/` and `services/ml/`. If you pass
+`services/api` as the build context, the build fails with
+`"COPY failed: services/ml: file not found"`.
+
+Correct invocation:
+```bash
+az acr build \
+  --registry artguideprodcr \
+  --image art-guide-api:v2 \
+  --file services/api/Dockerfile \
+  .    # ← repo root, not services/api/
+```
+
+### Gotcha quick-reference table
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Container App shows hello-world after Bicep deploy | `apiImage` not parameterized or `parameters.prod.json` had wrong value | Add `param apiImage` with real default; pin in params; run what-if |
+| `/healthz` returns HTML | `targetPort` set to 80 (hello-world) not 8000 (uvicorn) | `az containerapp ingress update --target-port 8000`; fix params |
+| Image pull UNAUTHORIZED from ACR | `registries` config wiped by Bicep redeploy | `az containerapp registry set --server <acr>.azurecr.io --identity system` |
+| `az acr build` "services/ml: file not found" | Build context is `services/api/` not repo root | Use `.` as build context with `--file services/api/Dockerfile` |

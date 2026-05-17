@@ -57,6 +57,20 @@
 - **ios-engineer:** Prod now live. Test against real catalog. Sunflowers = known-good smoke test.
   - **Update (2026-05-16 23:35):** iOS app build is now green (13 tests passing, zero warnings). Brady fixed xcodegen regen + async lock issues and is testing on simulator against live prod. Watch for any retrieval surface issues he surfaces (e.g., confidence thresholds, ambiguous matches, score distribution).
 
+## Cross-Agent Note — 2026-05-17 (backend-engineer — Bicep regression + fix)
+
+**INCIDENT:** ml-retrieval-engineer's Bicep deploy (D-029 ingest job add) caused API revision --0000004 to revert to `mcr.microsoft.com/azuredocs/containerapps-helloworld:latest` with port 80 ingress. Root causes:
+
+1. `parameters.prod.json` had `containerPort: 80` (hello-world default, never updated to 8000).
+2. `main.bicep` had no `apiImage` parameter — image was hardcoded to the literal string (which was v1 in HEAD but may have been hello-world in the deployed version).
+3. The registry binding (`registries: identity: system`) was wiped by the Bicep redeploy.
+
+**Fix:** backend-engineer restored prod in ~10 min via `az containerapp registry set` + `az containerapp update --image v1`. Then added `apiImage`, `apiCpu`, `apiMemory` params to Bicep (D-038). Fixed `parameters.prod.json` containerPort to 8000. Added `what-if` guard in `deploy.sh` that hard-fails if hello-world would be deployed. **Future infra deploys are now protected.**
+
+**v2 image shipped:** Wave 2 museum-plaque prompt (D-036) is now live as `art-guide-api:v2`, revision --0000006.
+
+**For future infra work:** Always run `az deployment group what-if` before `az deployment group create`. If you see the API container changing in what-if, check `parameters.prod.json` first.
+
 ---
 
 See `history-archive.md` for earlier learning (Phase 0 foundation, embedding selection, 5x transformers bug, test discipline fixes, eval bootstrap, iOS Codable shape mismatch, Met enrichment tier (a) implementation).

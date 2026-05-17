@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westus3"
+    },
+    "prefix": {
+      "value": "art-guide-prod"
+    },
+    "acrName": {
+      "value": "artguideprodcr"
+    },
+    "storageName": {
+      "value": "artguideprodst"
+    },
+    "kvName": {
+      "value": "art-guide-prod-kv"
+    },
+    "pgName": {
+      "value": "art-guide-prod-pg"
+    },
+    "pgAdminUser": {
+      "value": "artguideadmin"
+    },
+    "budgetAlertEmail": {
+      "value": "xam3002@hotmail.com"
+    },
+    "budgetAmountUsd": {
+      "value": 50
+    },
+    "budgetStartDate": {
+      "value": "2026-05-01"
+    },
+    "apiImage": {
+      "value": "artguideprodcr.azurecr.io/art-guide-api:v2"
+    },
+    "apiCpu": {
+      "value": "1.0"
+    },
+    "apiMemory": {
+      "value": "2Gi"
+    },
+    "containerPort": {
+      "value": 8000
+    }
+  }
+}
