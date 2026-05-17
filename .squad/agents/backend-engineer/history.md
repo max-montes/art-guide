@@ -159,3 +159,7 @@ Created `art-guide-prod-monthly` budget via `az rest PUT` against Microsoft.Cons
 
 Added "Cost monitoring" section to `docs/deployment.md` with portal URL, CLI queries, budget notes.
 
+## Cross-Agent Coordination Note — 2026-05-17 (ios-engineer-3 completed)
+
+iOS deployment target **raised to 17.0** (required for SwiftData local history feature, D-034). Affects any future iOS coordinate work. No backend changes required; iOS handles persistence locally. Server continues to accept uploads from any compatible iOS version; feature is opt-in on device.
+

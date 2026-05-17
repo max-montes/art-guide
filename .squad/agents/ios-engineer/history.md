@@ -1,5 +1,64 @@
 # iOS Engineer History (Current)
 
+## 2026-05-16 — Local Query History + TabView (D-034, D-036, D-037)
+
+### What changed
+
+**Files added:**
+- `apps/ios/ArtGuide/Models/HistoryEntry.swift` — `@Model` class (SwiftData)
+- `apps/ios/ArtGuide/Utilities/ThumbnailGenerator.swift` — JPEG thumbnail generation in pixel space
+- `apps/ios/ArtGuide/Views/HistoryView.swift` — history list, row, badge, empty state, swipe-delete
+- `apps/ios/ArtGuide/Views/ResultDetailView.swift` — re-renders stored result via existing `ResultView`
+- `apps/ios/ArtGuideTests/ThumbnailGeneratorTests.swift` — 7 unit tests
+- `apps/ios/ArtGuideTests/HistoryEntryTests.swift` — 6 persistence smoke tests
+
+**Files modified:**
+- `apps/ios/ArtGuide/ArtGuideApp.swift` — `ModelContainer` init + `.modelContainer()` modifier
+- `apps/ios/ArtGuide/Views/RootView.swift` — refactored to `TabView`; old body extracted to `CameraFlowView`; `saveToHistory()` added to `CameraFlowView`
+- `apps/ios/project.yml` — deployment target bumped from 16.0 → 17.0 (D-034; SwiftData requires iOS 17+)
+
+### Architecture decisions
+
+**ModelContainer location:** `ArtGuideApp.init()` creates `ModelContainer(for: HistoryEntry.self)`. Fatal error on failure (schema is trivial; a crash here surfaces real data-corruption issues). `.modelContainer(modelContainer)` attached to `WindowGroup` root so every descendant view has `@Environment(\.modelContext)`.
+
+**Tab structure:**
+```
+RootView (TabView)
+├── CameraFlowView (NavigationStack + "ArtGuide" title) [Camera tab]
+└── NavigationStack → HistoryView                       [History tab]
+```
+
+**Save flow:** After `session.client.identify()` succeeds (any status):
+1. `Task { await saveToHistory(image:response:) }` — fire-and-forget
+2. Thumbnail generation: `Task.detached(priority: .userInitiated) { ThumbnailGenerator.generate(from:) }.value`
+3. `JSONEncoder().encode(response)` → `rawResponseJSON`
+4. `modelContext.insert(HistoryEntry(...))`
+5. Any failure logs + returns; never surfaces to UI
+
+**Re-rendering:** `ResultDetailView` decodes `rawResponseJSON` with `JSONDecoder` and passes `IdentifyResponse` to `ResultView`. Same view, zero duplication.
+
+**IdentifyResponse JSON round-trip:** `IdentifyResponse` is `Codable`; stored properties (`requestID`, `match`, `explanation`) encode/decode faithfully. Computed accessors (`status`, `topCandidate`, etc.) reconstruct correctly from the decoded stored properties. Verified in `HistoryEntryTests.test_rawResponseJSON_decodesBackToIdentifyResponse`.
+
+### Gotchas
+
+**SwiftData + Previews:** Use `.modelContainer(for: HistoryEntry.self, inMemory: true)` in all `#Preview` blocks that touch `HistoryView` or any view with `@Environment(\.modelContext)`. Using the default on-disk container in previews can cause crashes in the Xcode preview canvas because multiple preview processes may open the same SQLite file.
+
+**UIGraphicsImageRenderer scale factor:** The renderer defaults to the device's screen scale (e.g., 3× on iPhone 17 Pro). This means point-space `newSize` → 3× pixel output. `ThumbnailGenerator` always sets `format.scale = 1.0` to work in pixel space, ensuring the output is exactly `maxLongEdge` pixels regardless of device scale. Tests that check decoded `UIImage.size` compare against pixel dimensions (scale=1 images: `.size` == pixel size).
+
+**SwiftData OSAllocatedUnfairLock note:** `ModelContext` is `@MainActor`-bound in the app. `saveToHistory()` is marked `@MainActor` and only spawns a detached task for the CPU thumbnail work, hopping back to main for the insert. No secondary contexts or background ModelContexts needed for this workload.
+
+**Deployment target bump (16.0 → 17.0):** Required for SwiftData. No iOS 16-only APIs existed in the codebase; bump was clean. Brady is on a current iPhone. See D-034.
+
+**"Never store raw images" clarification (D-036):** The project hard rule is server-side only. Local device thumbnail caching for the user's own history view is standard iOS UX and is explicitly permitted. Bearer token is never stored in `HistoryEntry`; only the response body (which does not contain it) is persisted.
+
+### Build + test
+
+**Deployment target:** iOS 17.0 (bumped from 16.0)
+**Build:** SUCCEEDED (iPhone 17 Pro Simulator)
+**Tests:** 52/52 passed (41 pre-existing + 7 ThumbnailGeneratorTests + 6 HistoryEntryTests)
+
+---
+
 ## 2026-05-16 — Error Screen Polish (follow-up to B.1/B.2)
 
 ### What changed
@@ -115,86 +174,3 @@ Updated `.squad/skills/ios-coldstart-tolerance/SKILL.md` — added "Staged Cold-
 **Skill:** `.squad/skills/ios-coldstart-tolerance/SKILL.md`
 
 ---
-
-## Current Status — 2026-05-16
-
-**App scaffold complete.** SwiftUI code ready; `.xcodeproj` creation deferred to project owner. All models and views wired per `docs/data-model.md` and `docs/api.md`. Config pointing to live prod API (via `Config.local.xcconfig`).
-
-**What's in place:**
-- SwiftUI scaffold (`apps/ios/ArtGuide/` directory structure)
-- Models: `IdentifyResponse`, `ArtworkCandidate`, `Explanation`, `MatchStatus`, `APIError`
-- Networking layer: `APIClient` (multipart upload, bearer auth), `Endpoints`, `RateLimitInfo`
-- Per-status views (exact | likely | style_only | no_match) per D-005 thresholds
-- Shared components: `ConfidenceBadge` (color thresholds), `ArtworkCard` (compact + full)
-- Mock data and `MockAPIClient` for Simulator preview/dev
-- Image pre-processing rules: long edge ≤ 1600 px, JPEG q=0.85, EXIF stripped, 10 MB cap (per `docs/image-pipeline.md`)
-- Config system: `Config.xcconfig` + `AppConfig.swift` reading `API_BASE_URL` + `API_KEY`
-- Privacy strings in `Info.plist`: camera + photo library usage
-
-**Infrastructure wired (coordinator):**
-- `apps/ios/Config.local.xcconfig` → prod API: `https://art-guide-prod-api.kindglacier-84ffc0b4.westus3.azurecontainerapps.io`
-- Bearer token from Key Vault configured
-- Swagger (`/docs`) available for manual endpoint testing
-
-**What's NOT done yet:**
-- `.xcodeproj` creation (project owner in Xcode)
-- First Simulator build + test
-- Switch from `MockAPIClient` to live `APIClient`
-- End-to-end test (camera → upload → identify)
-- App icon, splash screen, accessibility, localization
-
-**Known operational issue (backend):**
-- First request after API scale-to-zero blocks ~10–30s (model load). Subsequent <150 ms. May need retry logic or minReplicas=1 in Phase 2.
-
-## Cross-Agent Note — 2026-05-16 (ml-retrieval-engineer)
-
-Prod is now fully end-to-end live (D-029). You can test the iOS app against the prod URL with real Met catalog responses. Try Sunflowers as a known-good smoke test image. Expect ~3s warm response, longer on cold start (D-028 cold-start issue noted; revisit in Phase 2).
-
-## Next Steps
-
-1. **Create `.xcodeproj`** — Project owner to create new SwiftUI project in Xcode, merge existing source folders
-2. **First Simulator build** — Verify app builds and runs with `MockAPIClient`
-3. **Switch to live API** — Wire `APIClient` to prod backend
-4. **End-to-end test** — Camera + upload → `/v1/identify` endpoint
-5. **Monitor cold-start** — Observe latency on first post-scale request; gather data for Phase 2 cold-start decision
-6. **Polish status views** — Typography, error states, retry affordance for 429 (once real responses available)
-7. **Add "About" screen** — Privacy disclosure per `docs/privacy-observability.md`
-
-## Learnings
-
-**XcodeGen regen is mandatory after adding Swift files (second incident — 2026-05-16):**
-- Symptom: cascade of "Cannot find X in scope" in Xcode for types that exist on disk.
-- Root cause: `.xcodeproj` compile-phase list is static until `xcodegen generate` runs.
-- Fix: `cd apps/ios && xcodegen generate` + commit the result alongside new Swift files.
-- Regression prevention chosen: Documentation (prominent callout in `apps/ios/README.md`
-  + `⚠️ CRITICAL` heading in `xcodegen-app-spec` SKILL.md). Pre-commit hook deferred.
-- See `.squad/decisions/inbox/ios-engineer-xcodegen-regen-protocol.md`.
-
-**MockAPIClient async lock (2026-05-16):**
-- `NSLock.lock()/unlock()` inside `async func` is a Swift 6 error (warning in 5.9/5.10).
-- Pattern chosen: `OSAllocatedUnfairLock<Int>` (Option A) — async-safe `withLock` closure,
-  zero call-site changes, available iOS 16+ matching our deployment target.
-- Did NOT convert to `actor` because `MockAPIClient`'s mutable properties are accessed
-  synchronously from previews/tests and would require `await` at every access.
-- See `.squad/skills/swift-actor-vs-lock/SKILL.md` for the full decision tree.
-
-**ArtGuideTests plist fix (2026-05-16):**
-- Unit-test bundle was missing `GENERATE_INFOPLIST_FILE: YES` in project.yml, causing
-  code-sign failure on `xcodebuild test`. Fixed by adding to `ArtGuideTests` target settings.
-
-**Build status 2026-05-16:** BUILD SUCCEEDED, all 13 tests pass, zero warnings.
-
-**Config pattern works well:**
-- `Config.xcconfig` + `AppConfig.swift` provides clean env override without hardcoding URLs/keys.
-- Fits the "same image for local + prod" pattern (D-011).
-
-**Multipart upload + bearer auth:**
-- `URLSession.upload(for:from:delegate:)` works well for multipart image.
-- Bearer token in `URLRequest.setValue(_:forHTTPHeaderField:)` is straightforward.
-
-**Per-status view routing:**
-- Clean separation of UI logic per confidence band (exact, likely, style_only, no_match).
-- Never invents missing fields; always checks for nil.
-- Mock data covers all 4 bands including edge cases (e.g., likelyAmbiguous with 3 candidates, gap<0.05).
-
-See `history-archive.md` for scaffolding and early learning iterations.

@@ -71,6 +71,10 @@
 
 **For future infra work:** Always run `az deployment group what-if` before `az deployment group create`. If you see the API container changing in what-if, check `parameters.prod.json` first.
 
+## Cross-Agent Coordination Note — 2026-05-17 (ios-engineer-3 completed)
+
+iOS deployment target **raised to 17.0** (required for SwiftData local history feature, D-034). Affects any future iOS coordination work. No impact on dataset ingest or embedding pipeline; iOS handles persistence locally.
+
 ---
 
 See `history-archive.md` for earlier learning (Phase 0 foundation, embedding selection, 5x transformers bug, test discipline fixes, eval bootstrap, iOS Codable shape mismatch, Met enrichment tier (a) implementation).
