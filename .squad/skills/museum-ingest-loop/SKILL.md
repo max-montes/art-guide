@@ -3,7 +3,7 @@ name: "museum-ingest-loop"
 description: "Reusable fetch → preprocess → embed → upsert template for museum Open Access sources"
 domain: "ml-retrieval"
 confidence: "high"
-source: "earned (art-guide Met Open Access ingest — 2026-05-10)"
+source: "earned (art-guide Met Open Access 2026-05-10; AIC + Rijks 2026-05-17 — three independent sources now share the same outer loop)"
 ---
 
 ## Context
@@ -34,7 +34,18 @@ A retrieval-first art system needs to populate its vector catalog from N museum 
 
 - **`asyncio.to_thread(embed_bytes, …)` to keep the loop responsive.** With an `httpx.AsyncClient` driving I/O concurrently and a sync PyTorch embedder in the middle, offloading the embed call lets the event loop continue draining HTTP responses for the next records.
 
-- **Polite by default, retried by default.** Identify yourself in the User-Agent. Floor the request rate (e.g. 0.15 s ≈ 6 req/s ceiling). Exponential backoff with jitter on 429s and transient 5xxs, capped retries. Single-record failures are logged at WARNING and counted in stats; never abort the whole run.
+- **Polite by default, retried by default — but only on transient errors.**
+  Identify yourself in the User-Agent. Floor the request rate
+  (e.g. 0.15 s ≈ 6 req/s ceiling per replica). Exponential backoff with
+  jitter on **429s, 5xx, and network errors**; capped retries.
+  **Do NOT retry permanent 4xx (everything except 429).** Per-record
+  403/404 (a museum-restricted record, a retired id) wastes the polite
+  request budget — 5 retries × backoff is 31 s of sleep per bad record.
+  At single-replica / 6 req/s this is invisible; at 8 replicas /
+  20 req/s/replica with 30-50% 403 rates it's catastrophic
+  (~80% throughput loss). Skip immediately and `continue`.
+  Single-record failures are logged at WARNING and counted in stats;
+  never abort the whole run.
 
 - **Stats object as the only run summary.** A small `IngestStats` dataclass with `candidate_ids`, `fetched`, `skipped_filter`, `skipped_image_error`, `skipped_embed_error`, `skipped_db_error`, `inserted`, `updated`, `rate_limited_events` covers every failure mode the operator needs to see. Print it at the end; that's the operator UI.
 
@@ -181,3 +192,127 @@ az containerapp job logs show \
 
 **Corpus count (2026-05-16):** Met public-domain objects: **501,696** (URL: `https://collectionapi.metmuseum.org/public/collection/v1/objects?isPublicDomain=true`). This drifts upward as Met adds records. Re-check before each full-catalog run.
 
+
+## Confirmed sources (as of 2026-05-17)
+
+| Source | Adapter | Discovery API | Per-record format | Public-domain catalog | Notes |
+|---|---|---|---|---|---|
+| The Metropolitan Museum of Art | `ml.ingest.met_db` | `/objects?isPublicDomain=true` (single JSON of 501K ids) | JSON `/objects/{id}` | ~501,696 | 80 req/s per-IP cap; use single-worker; image CDN needs Safari UA + image Accept |
+| Art Institute of Chicago | `ml.ingest.aic_db` | `/artworks?fields=...&page=N` paginated | JSON | ~100K (estimate) | Published 60 req/min cap; do not exceed |
+| Rijksmuseum (Amsterdam) | `ml.ingest.rijks_db` | OAI-PMH `ListRecords?set=...&metadataPrefix=edm` (50 records/page incl. inline Concepts + Agents) | EDM RDF/XML | ~5,000 (paintings + sculpture sets, after no-image filter) | No API key, no published rate limit; adopt 5 req/s. Images via IIIF CDN at `iiif.micr.io`. Rijks gives `dc:description` (interpretive text Met doesn't have) — stashed in `raw_metadata.description_en`. |
+
+Three sources now share the same outer loop (`discover → map → image → embed → upsert`). The mapper's signature changes per source — JSON dict for Met/AIC, parsed XML dict for Rijks — but **all flow into the same `(source, source_id)` upsert against `artworks`**, so retrieval is single-table. The `museum-ingest-loop` skill is now **high confidence** (validated across three independent API shapes: REST/JSON, paginated REST/JSON, OAI-PMH/RDF-XML).
+
+### Rijks-specific extensions to the loop
+
+* **OAI-PMH resumption-token pagination.** Unlike REST APIs, OAI-PMH's "next page" is a base64 token returned in the previous response (NOT a `?page=N` parameter). The mapper code must remember to send `?verb=ListRecords&resumptionToken=...` *without* re-sending `set` or `metadataPrefix` (spec requirement). See `_list_records_page()` in `rijks_db.py`.
+* **Inline entity resolution.** Rijks EDM responses inline all `<edm:Agent>` and `<skos:Concept>` entities referenced by URI from inside `<edm:ProvidedCHO>` — so creator names, medium labels, and subject labels are all available without follow-up HTTP requests. Build per-record `concepts: dict[URI, {en, nl}]` and `agents: dict[URI, {names, birth, death}]` maps when parsing the record, then resolve all references locally.
+* **Multi-set discovery is N sequential resumption-token loops.** Each `setSpec` is harvested independently. The orchestrator loops over the set tuple and within each set walks the resumption tokens until exhausted. Idempotent upsert keeps this safe across re-runs.
+* **`xml:lang` is a preference, not a guarantee.** Rijks emits the same field with multiple `xml:lang` tags but the *language tag does not reliably match the content* — the "en" entry may carry Dutch text. Treat language tag as preference, fall back to whatever's present.
+* **Schema gap: descriptions.** Rijks has free-text `dc:description xml:lang="en"` on ~50% of records — Met has nothing equivalent. Per the skill rule "don't promote columns reactively," v1 stashes this in `raw_metadata.rijks.description_en`. Backend can later promote to a `description` column when (a) a second source needs it (AIC has `description` too — already covered by the AIC adapter's `raw_metadata`), and (b) a query path needs it (grounded LLM prompt is the obvious one).
+
+## AIC-specific deltas (added 2026-05-17, multi-source validation)
+
+When porting the Met template to the Art Institute of Chicago, these are
+the dimensions where adapters diverge. Future adapters (Rijksmuseum,
+Harvard, Smithsonian, Cleveland) will sit somewhere on each axis.
+
+### Axis 1 — Discovery shape (listing vs. listing + detail)
+
+| Source | Discovery | Per-record detail | Total budget |
+| --- | --- | --- | --- |
+| Met | `/objects?isPublicDomain=true` returns a single huge array of ~500K ids | `/objects/{id}` per record (mandatory; the listing has no fields) | ~501K + ~501K image = ~1M requests |
+| AIC | `/artworks?page=N&limit=100&fields=...` returns full records in batches of 100 | **None — listing already has every field we need** | ~1.3K listing + ~62K image = ~63K requests |
+
+**The AIC pattern is strictly better when the source supports it** — half
+the request budget vs. Met. Always check the source docs for a
+`fields=` (or equivalent) parameter on the listing endpoint before
+defaulting to the Met pattern. If listing supports filtering + field
+projection, skip the detail call entirely. The adapter still keeps a
+`_fetch_object(id)` helper for ad-hoc reingest / debugging, but the
+steady-state walk does not invoke it.
+
+### Axis 2 — Image URL construction
+
+| Source | Pattern | CDN headers needed? |
+| --- | --- | --- |
+| Met | `raw['primaryImage']` (museum-hosted absolute URL) | **Yes** — `images.metmuseum.org` WAF rejects non-browser UA; needs `_IMAGE_CDN_HEADERS` override per request |
+| AIC | IIIF: `{config.iiif_url}/{image_id}/full/843,/0/default.jpg` | **No** — Cloudflare CDN with `Access-Control-Allow-Origin: *`, plain client works |
+
+**IIIF URLs are constructed, not fetched.** Most modern museum APIs
+expose an `image_id` (UUID-ish) + an `iiif_url` config field. The
+constructed URL pattern `/full/{w},/0/default.jpg` is IIIF Image API 2.0
+standard and works against AIC, Yale Center for British Art, Cleveland
+Museum, Getty, and others. Hardcode the width to the museum's
+recommended cached size (AIC: 843px) for best cache hit rate. Read the
+`config.iiif_url` field from a response if you want to be paranoid about
+museum CDN migrations; otherwise pin the constant in code with a
+test that asserts the spec.
+
+### Axis 3 — Rate limit (the constraint that drives parallelism design)
+
+| Source | Published cap | Single-IP enforcement | Right shape |
+| --- | --- | --- | --- |
+| Met | 80 req/s | Yes (per D-052: 403 storm on overage, ≥40 min cooldown, no `Retry-After`) | **Single worker, `request_delay ≈ 0.015s` (66 req/s, 82% of cap)** |
+| AIC | 60 req/min ≈ 1 req/s | Yes — docs explicitly say "no parallel scrapers, 1 second between requests" | **Single worker, `request_delay ≈ 1.05s` (57 req/min, 95% of cap)** |
+| Rijksmuseum (TBD) | Per-key, 10,000/day default | Per-API-key | Parallel-N with one key per replica (different from Met/AIC pattern) |
+
+**Rule:** parse the source's published rate-limit doc BEFORE writing
+any code. If the cap is per-IP, single worker at the cap (single-worker
+rate-limit-aware pattern in `prod-catalog-ingest`). If per-key, parallel
+shards with key isolation (parallel-sharded pattern, same skill). Never
+guess.
+
+### Axis 4 — Classification filter width
+
+| Source | Project filter | Rationale |
+| --- | --- | --- |
+| Met | `_classification_matches` accepts only "Paintings" / "Sculpture" / variants | Met catalog is enormous and skewed; wider filter pulls in coins/photographs/prints that hurt eval signal |
+| AIC | `_AIC_ACCEPTED_TYPES` accepts Painting / Sculpture / Print / Drawing / Photograph / Vessel / Textile / Costume / Book / Manuscript / Coin / ... | AIC's strength is non-Western, Asian, decorative arts, prints — these are exactly the gaps the Met adapter leaves; AGENTS.md hard rule #5 ("catalog over model") prefers wide |
+
+**Both are correct per their context.** The filter width is a
+PRODUCT decision per-source, not a template-level rule. Document the
+acceptance set as a module-level frozenset (not a regex) so it's
+introspectable and unit-testable.
+
+### Axis 5 — Field naming + nullability
+
+Met returns empty strings (`""`) for unknown fields. AIC returns JSON
+`null`. The mapper's `raw.get("x") or None` idiom collapses both into
+canonical `None`, so the upstream consumer never needs to know which
+convention the source uses. **Always normalize to `None` in the mapper**,
+never propagate empty strings or 0-as-placeholder dates downstream.
+
+### What stays identical across Met / AIC (and will stay identical for Rijks)
+
+1. **`map_<source>_record(raw) -> dict | None`** — pure function, no I/O.
+2. **`_INSERT_SQL`** — verbatim copy. Same column set, same ON CONFLICT,
+   same `xmax = 0` insert-vs-update detection.
+3. **`_commit_batch(pool, batch, *, stats)`** — verbatim copy.
+4. **`IngestStats`** dataclass — identical counters. (AIC adds
+   `pages_walked` since the listing has explicit pagination; Met doesn't
+   have an equivalent because it discovers ids upfront.)
+5. **`_get_with_retry()`** — verbatim copy. Same retry-on-429/5xx,
+   bail-on-permanent-4xx logic. Universal HTTP discipline.
+6. **`asyncio.to_thread(embedder.embed_bytes, img_bytes)`** — keeps the
+   event loop responsive for in-flight HTTP while the sync PyTorch
+   embedder runs.
+7. **`finally: img_bytes = None`** — D-012 / hard rule #3 enforcement.
+   Image bytes never outlive the iteration that produced them.
+
+### Anti-patterns observed during multi-source porting
+
+1. **Copy-pasting the full Met `_get_with_retry`'s docstring without
+   editing the source-name placeholder.** Looks fine in code review;
+   confuses operators reading log warnings. The warning message must
+   reference the right source.
+2. **Forgetting to update the `museum=` constant.** Bug only visible
+   downstream (LLM grounding pulls the wrong museum name). Add a unit
+   test that asserts `out["museum"] == AIC_MUSEUM_NAME` per source.
+3. **Copying the Met classification filter set verbatim.** Almost
+   certainly the wrong project filter for the new source — AIC's filter
+   is intentionally wider. Always reconsider the filter set per-source.
+4. **Hardcoding the IIIF base URL when the source exposes
+   `config.iiif_url`.** Future migration risk. Pin the constant in code
+   AND assert it matches the live API response in an integration test
+   (not done in v1 — flagged as a follow-up).

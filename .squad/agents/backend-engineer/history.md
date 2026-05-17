@@ -47,6 +47,25 @@ az containerapp revision restart --name art-guide-prod-api -g art-guide-prod-rg 
 
 **Current status (end of session):** Brady's residential IP in ≥40 min cooldown (last burst 2026-05-17T04:34Z). Azure Container Apps egress IP in ≥60 min cooldown (last burst 2026-05-17T03:20Z). Both expected to clear by ~06:30Z. Rijks laptop ingest (different host: `data.rijksmuseum.nl`) is live and healthy.
 
+## Met ACA Job Deployment — 2026-05-17T12:44Z (session)
+
+**Gate results:**
+
+| Gate | Result | Notes |
+|------|--------|-------|
+| T-1 DSN | ✅ | Secret exists as `database-url` (not `db-url` as runbook says — runbook has wrong name). Host = `art-guide-prod-pg.postgres.database.azure.com`. Well-formed `postgresql://` scheme. |
+| T-2 Met API key | ✅ | Auto-pass — no key required. |
+| T-3 ACR image | ✅ | `latest` tag present, pushed 2026-05-17T19:04:06Z (HEAD 8544dc7 contains `--resume-skip-existing`). No new build needed. |
+| T-4 ACA env | ✅ | `art-guide-prod-cae` confirmed in West US 3. |
+| T-5 IP cooldown | ✅ | HTTP 200 from Met API — Azure egress IP clear of penalty box. |
+
+**Actions taken:**
+- Updated job definition via `az containerapp job update --yaml` (not Bicep, to avoid secret-reset bug): command changed from `met` → `met-dump --limit 0 --request-delay 0.015 --batch-commit-size 64 --batch-size 4 --resume-skip-existing`; image changed from `v4` → `latest`.
+- Started job: execution `art-guide-prod-ingest-eins3l3`, status Running, start time 2026-05-17T19:47:44+00:00.
+- Log Analytics unavailable immediately after start (expected — logs take 2-3 min to propagate).
+- Expected completion: ~23:00–23:47Z (3–4 hr wall time).
+- Runbook bug noted: T-1 gate references secret name `db-url` but actual name in KV is `database-url`. Fixed in this entry; runbook should be updated.
+
 ## Learnings
 
 - **IP-ban vs. rate-limit diagnosis:** Flatline of 403s with zero 200s in monitoring = IP-ban (not rate-limit). 429s with intermittent 200s = rate-limit, recoverable with exponential backoff. Checking log data alone is not sufficient — verify ground truth by querying the DB (`SELECT source, COUNT(*) FROM artworks GROUP BY source`).
@@ -64,4 +83,10 @@ az containerapp revision restart --name art-guide-prod-api -g art-guide-prod-rg 
   - Expected ~$1.10–1.60 per full run, ~3–4 hr wall time.
   - Brady reviews `docs/met-aca-job.md` before any `az` command runs.
   - Key files: `docs/met-aca-job.md` (runbook), `services/ml/ml/ingest/met_csv.py` (resume-skip port), `services/ml/ml/cli.py` (flag + summary), `.squad/decisions/inbox/backend-engineer-met-aca-job.md` (D-NNN candidate).
+
+- **Met IP-ban circuit breaker incident (2026-05-17 / eins3l3):** Job ran for ~3 hours writing 0 rows because the Azure Container Apps egress IP was banned. Root cause: `--request-delay 0.015` (66 req/s) is ~11× the safe `met_db` default and likely caused a re-ban within minutes of starting, even though the T-5 gate check showed HTTP 200. The code silently counted each record as `skipped_api_error` and continued — no hard failure, no log-analytics data (known workspace lag), 0 rows written.
+  - **Fix shipped (commit 90bd6a0):** `MetAPIBannedError` + `_probe_met_api()` (upfront 403 probe) + `DEFAULT_CONSECUTIVE_403_LIMIT=50` in-loop circuit breaker. Validated on execution `fw140av`: failed in ~50s with clear error instead of hours.
+  - **Request delay corrected:** `--request-delay` updated from `0.015` → `0.1` (10 req/s) in job definition. This halves throughput but keeps within a safe margin.
+  - **IP state at 23:10Z:** Still banned. Do not restart until 01:00Z at earliest. Start the job — if the IP is clear, it will run; if not, the circuit breaker will fail in <60s.
+  - **Probe limitation noted:** The upfront probe checks object ID 1. If that specific object returns 404 (not PD or non-existent), the probe won't catch a full IP ban; the circuit breaker at 50 consecutive 403s will still catch it. Consider using a known PD object (e.g., 436523) as the probe target in a future improvement.
 
