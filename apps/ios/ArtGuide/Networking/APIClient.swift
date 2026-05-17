@@ -86,8 +86,8 @@ final class APIClient: APIClientProtocol, @unchecked Sendable {
             (data, response) = try await session.data(for: request)
         } catch is CancellationError {
             throw APIError.cancelled
-        } catch let urlErr as URLError where urlErr.code == .cancelled {
-            throw APIError.cancelled
+        } catch let urlErr as URLError {
+            throw APIError.map(urlErr)
         } catch {
             throw APIError.transport(error.localizedDescription)
         }
@@ -126,8 +126,8 @@ final class APIClient: APIClientProtocol, @unchecked Sendable {
             (data, response) = try await session.data(for: request)
         } catch is CancellationError {
             throw APIError.cancelled
-        } catch let urlErr as URLError where urlErr.code == .cancelled {
-            throw APIError.cancelled
+        } catch let urlErr as URLError {
+            throw APIError.map(urlErr)
         } catch {
             throw APIError.transport(error.localizedDescription)
         }

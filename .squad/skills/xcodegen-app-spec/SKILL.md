@@ -1,9 +1,9 @@
 ---
 name: xcodegen-app-spec
 purpose: Generate a single-target SwiftUI iOS app .xcodeproj from a YAML spec, wiring an existing on-disk Info.plist + xcconfig + scheme env vars correctly.
-when_to_use: You have Swift sources, an Info.plist, and an xcconfig already on disk, but no .xcodeproj — and you want a reproducible, source-controllable project file rather than asking developers to click through Xcode's New Project wizard. ALSO run `xcodegen generate` any time you add Swift files to disk.
+when_to_use: You have Swift sources, an Info.plist, and an xcconfig already on disk, but no .xcodeproj — and you want a reproducible, source-controllable project file rather than asking developers to click through Xcode's New Project wizard. ALSO run `xcodegen generate` any time you add Swift files to disk. A pre-commit hook now automates this — see "Pre-commit hook" below.
 last_validated: 2026-05-16
-confidence: high
+confidence: very high
 ---
 
 # xcodegen-app-spec
@@ -20,6 +20,15 @@ cd apps/ios && xcodegen generate
 ```
 
 Then commit the regenerated `.xcodeproj` alongside your new Swift file.
+
+**Automated fix (pre-commit hook, installed 2026-05-16):**
+The repo now ships `.githooks/pre-commit` which reruns `xcodegen generate`
+automatically when `.swift` files under `apps/ios/` are staged, then stages
+the updated `.xcodeproj` into the same commit. Install once per clone:
+```bash
+./setup-hooks.sh   # from repo root
+# or: git config core.hooksPath .githooks
+```
 
 ## Problem
 

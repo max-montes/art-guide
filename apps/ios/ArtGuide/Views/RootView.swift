@@ -7,6 +7,8 @@ struct RootView: View {
 
     @EnvironmentObject private var session: AppSession
     @State private var phase: Phase = .capture
+    /// Secondary cold-start message shown beneath the loading spinner (B.2).
+    @State private var loadingMessage: String?
 
     enum Phase: Equatable {
         case capture
@@ -40,7 +42,7 @@ struct RootView: View {
             }
 
         case .loading(let progress):
-            LoadingView(progress: progress) {
+            LoadingView(progress: progress, statusMessage: loadingMessage) {
                 phase = .capture
             }
 
@@ -57,20 +59,49 @@ struct RootView: View {
     }
 
     private func identify(image: UIImage) async {
+        loadingMessage = nil
         phase = .loading(progress: 0.1)
+
+        // B.2: escalating cold-start messages on a background task.
+        // Each timer fires at the threshold and updates `loadingMessage`;
+        // the task is cancelled (via `identifyTask`) when identify completes.
+        let messageTask = Task {
+            do {
+                try await Task.sleep(for: .seconds(LoadingMessageThreshold.warmingUp))
+                await MainActor.run { loadingMessage = "Waking up the museum…" }
+                try await Task.sleep(for: .seconds(
+                    LoadingMessageThreshold.almostReady - LoadingMessageThreshold.warmingUp
+                ))
+                await MainActor.run {
+                    loadingMessage = "Almost ready — first match takes a bit longer…"
+                }
+                try await Task.sleep(for: .seconds(
+                    LoadingMessageThreshold.stillWorking - LoadingMessageThreshold.almostReady
+                ))
+                await MainActor.run {
+                    loadingMessage = "Still working on it — feel free to keep the camera steady…"
+                }
+            } catch {
+                // Task cancelled — identify finished before the threshold fired.
+            }
+        }
+
+        defer { messageTask.cancel() }
+
         do {
-            // We don't have first-class progress callbacks on
-            // URLSession.data(for:) — show indeterminate-feeling progress.
             phase = .loading(progress: 0.4)
             let response = try await session.client.identify(image: image)
             session.lastResponse = response
+            loadingMessage = nil
             phase = .result(response)
         } catch let apiErr as APIError {
             session.lastError = apiErr
+            loadingMessage = nil
             phase = .failure(apiErr)
         } catch {
             let wrapped = APIError.transport(error.localizedDescription)
             session.lastError = wrapped
+            loadingMessage = nil
             phase = .failure(wrapped)
         }
     }

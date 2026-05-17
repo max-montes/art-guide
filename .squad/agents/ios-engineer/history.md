@@ -1,5 +1,51 @@
 # iOS Engineer History (Current)
 
+## 2026-05-16 — B.1 Error UX, B.2 Cold-Start Messages, C.3 XcodeGen Hook
+
+### B.1 — Typed error enum + user-facing copy
+
+Replaced the generic `APIError.transport(String)` with fine-grained network cases:
+- `.networkUnreachable` ← `URLError.notConnectedToInternet / networkConnectionLost`
+- `.cannotFindHost` ← `URLError.cannotFindHost / dnsLookupFailed`
+- `.cannotConnect` ← `URLError.cannotConnectToHost`
+- `.timedOut` ← `URLError.timedOut` → "The server is waking up. Please try again in a moment."
+- `.tlsFailure(code:)` ← TLS/certificate URLError codes
+- `.transport(String, code:)` ← fallthrough; in DEBUG shows raw code + message
+
+Added `APIError.map(_ urlErr: URLError) -> APIError` static factory so both
+`identify` and `artwork` catch blocks use the same mapping (one line each now).
+
+Key copy decisions:
+- `timedOut` → actionable language tied to cold-start: "The server is waking up. Please try again in a moment."
+- `http(5xx)` → "The museum server hit a problem — try again in a moment."
+- `http(401/403)` and `.unauthorized` → "Authentication problem — this is a bug, please report it."
+- DEBUG builds always show the technical code/body; release builds show clean user copy.
+
+Added `ArtGuideTests/APIErrorTests.swift` — 15 unit tests covering the `URLError → APIError` mapping and `userFacingMessage` spot checks.
+
+### B.2 — Staged loading messages during cold-start
+
+Added `LoadingMessageThreshold` constants (3s / 10s / 25s) in `LoadingView.swift`.
+`LoadingView` now accepts `statusMessage: String?` with an opacity cross-fade.
+
+In `RootView.identify()`, a background `Task` sleeps between thresholds and posts messages to `@MainActor`. Task cancelled in `defer {}` so message clears instantly on success/failure. Copy: "Waking up the museum…" → "Almost ready — first match takes a bit longer…" → "Still working on it — feel free to keep the camera steady…". Message never says "cold-start" or "container".
+
+### C.3 — XcodeGen pre-commit hook
+
+Created `.githooks/pre-commit` (bash, executable): checks for staged `.swift` files under `apps/ios/`, runs `xcodegen generate`, stages `ArtGuide.xcodeproj`. If `xcodegen` is absent, prints "xcodegen not found. brew install xcodegen" and exits 1.
+
+Created `setup-hooks.sh` at repo root: `git config core.hooksPath .githooks`.
+
+Updated `apps/ios/README.md` Quick start section with hook install one-liner.
+
+Updated `.squad/skills/xcodegen-app-spec/SKILL.md` — bumped confidence to `very high`, added "Pre-commit hook" section describing `.githooks/pre-commit` and `setup-hooks.sh`.
+
+Updated `.squad/skills/ios-coldstart-tolerance/SKILL.md` — added "Staged Cold-Start Messages (B.2 pattern)" section with thresholds, Task-based timer pattern, and copy rules.
+
+**Build:** BUILD SUCCEEDED. **Tests:** 28/28 passed (13 pre-existing + 15 new `APIErrorTests`).
+
+---
+
 ## Cold-Start Fix — 2026-05-16 (D-028)
 
 **Symptom:** Brady hit "Could not connect to the server" on first `/identify` from real iPhone. Root cause: container scaled to zero, SigLIP load = ~20 s, URLSession.shared default timeouts fired first.

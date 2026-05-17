@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit
+#
+# When any Swift file under apps/ios/ is staged, regenerate
+# ArtGuide.xcodeproj with XcodeGen and stage the result so the project
+# file stays in sync with the source tree in the same commit.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+# or run:
+#   ./setup-hooks.sh
+set -euo pipefail
+
+# Check if any .swift files inside apps/ios/ are staged.
+staged_swift=$(git diff --cached --name-only --diff-filter=ACMR | grep '^apps/ios/.*\.swift$' || true)
+
+if [ -z "$staged_swift" ]; then
+    exit 0
+fi
+
+echo "🔧 Swift files staged under apps/ios/ — regenerating ArtGuide.xcodeproj…"
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+    echo "❌ xcodegen not found. Install it with:" >&2
+    echo "   brew install xcodegen" >&2
+    exit 1
+fi
+
+cd "$(git rev-parse --show-toplevel)/apps/ios"
+xcodegen generate --quiet
+
+# Stage the regenerated project file so it's included in the commit.
+git add ArtGuide.xcodeproj
+
+echo "✅ ArtGuide.xcodeproj regenerated and staged."

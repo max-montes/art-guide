@@ -89,6 +89,41 @@ public extension APIClientProtocol {
 
 ---
 
-## Outcome (art-guide, 2026-05-16)
+## Staged Cold-Start Messages (B.2 pattern — 2026-05-16)
 
-Cold-start: ~20 s → user sees camera screen → container wakes → model loads → user snaps photo → identify completes in ~3 s warm latency. Zero user-visible error.
+When identify takes longer than a few seconds, show escalating status messages
+**beneath the spinner** (not replacing it). Thresholds are defined as constants
+so they're tunable without hunting through view code:
+
+```swift
+enum LoadingMessageThreshold {
+    static let warmingUp: TimeInterval    = 3
+    static let almostReady: TimeInterval  = 10
+    static let stillWorking: TimeInterval = 25
+}
+```
+
+Implement with a background `Task` that sleeps between thresholds and posts to
+`@MainActor`. Cancel the task in `defer {}` so the message disappears instantly
+on success or failure:
+
+```swift
+let messageTask = Task {
+    do {
+        try await Task.sleep(for: .seconds(LoadingMessageThreshold.warmingUp))
+        await MainActor.run { loadingMessage = "Waking up the museum…" }
+        // …more thresholds…
+    } catch { /* cancelled */ }
+}
+defer { messageTask.cancel() }
+let response = try await client.identify(image: image)
+```
+
+**Copy rules:**
+- 3s: "Waking up the museum…" — acknowledges delay without alarming
+- 10s: "Almost ready — first match takes a bit longer…" — reassuring
+- 25s: "Still working on it — feel free to keep the camera steady…" — gentle, not alarming
+- Never say "server cold-starting" or "container" to end users
+
+**LoadingView API:** Add `statusMessage: String?` param. Nil hides the row;
+non-nil shows it with a cross-fade animation via `.animation(.easeInOut, value: statusMessage)`.

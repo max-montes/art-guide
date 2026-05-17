@@ -24,6 +24,8 @@ open ArtGuide.xcodeproj
 # ⌘R to run in the Simulator (uses MockAPIClient by default)
 ```
 
+**First-time setup:** run `./setup-hooks.sh` from the repo root to install pre-commit hooks (or `git config core.hooksPath .githooks`). The hook auto-regens `ArtGuide.xcodeproj` whenever Swift files are staged, preventing the "Cannot find X in scope" drift issue.
+
 That's the whole loop. The generated `.xcodeproj` is gitignored — `project.yml`
 is the source of truth. To change build settings, deployment target, scheme
 env vars, etc., edit `project.yml` and re-run `./setup.sh`. **Do not edit the
