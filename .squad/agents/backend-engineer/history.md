@@ -70,3 +70,43 @@ See `history-archive.md` for Phase 0 foundation work (endpoint scaffolding, erro
 ## Cross-Agent Note — 2026-05-16 (ios-engineer — cold-start hardening)
 
 **iOS now warms `/healthz` before `/identify` (D-033).** The camera view (RootView) fires a background `GET /healthz` on appear, so the container wakes + model loads while the user is looking at the UI. Combined with raised timeouts (60s per-segment, 90s total), this mitigates the cold-start latency observed in D-028. Expect occasional unprovoked `/healthz` traffic from the app — that's intentional.
+
+## Wave 2 Museum-Plaque Prompt + Cost Controls — 2026-05-16
+
+**Task A.3 — Wave 2 LLM prompt shipped.**
+
+Rewrote `services/api/app/llm.py` prompt layer:
+
+- `_BASE_RULES`: changed from generic "museum-guide-style explanation" to explicit **warm curator/docent voice** ("knowledgeable but warm, authoritative and unhurried, not marketing copy").
+- `_STATUS_GUARDRAILS[exact]`: now instructs LLM to weave `artist_bio` and `credit_line` naturally into prose, skip dimensions unless notably large/small, lead with dynasty/period for non-Western works.
+- `_STATUS_GUARDRAILS[likely]`: same enrichment weave but maintains hedging tone throughout; allows brief visual ambiguity note.
+- `_STATUS_GUARDRAILS[style_only]`: reinforced — "resembles the work of X" / "in the manner of X" only; explicit "do NOT name or claim the specific artwork".
+- `_NO_MATCH_TEXT`: updated to docent voice — "I can't place this one — could be a private work, a reproduction, or just outside what I know."
+- **LLM params**: removed `temperature` (gpt-5-mini is a reasoning model, only supports default=1). Replaced `max_tokens=220` with `max_completion_tokens=1500` (reasoning models consume ~700 tokens internally; 250 was insufficient and returned empty content).
+
+**Smoke test result (gpt-5-mini-2025-08-07, L'Arlésienne record):**
+
+> "Vincent van Gogh (Dutch, Zundert 1853–1890 Auvers-sur-Oise) painted L'Arlésienne: Madame Joseph-Michel Ginoux (Marie Julien, 1848–1911) in 1888–89 in oil on canvas. The painting is in The Metropolitan Museum of Art and entered the collection as the bequest of Sam A. Lewisohn in 1951."
+
+Old output (flat stub style):
+> "L'Arlésienne: Madame Joseph-Michel Ginoux (Marie Julien, 1848–1911) is attributed to Vincent van Gogh, dated 1888–89. It is Oil on canvas. It is held in the collection of The Metropolitan Museum of Art."
+
+New output uses `artist_bio` + `credit_line`; skips dimensions (36×29 in is average-sized — correct). 73 API tests pass.
+
+**Key discovery:** `gpt-5-mini` = `gpt-5-mini-2025-08-07`, a reasoning model. Constraints:
+- No `temperature` param (hard error from API)
+- Uses `max_completion_tokens` not `max_tokens`
+- ~700 reasoning tokens consumed before output; need ≥1500 total
+
+**Task C.1 — Azure budget alert.**
+
+Created `art-guide-prod-monthly` budget via `az rest PUT` against Microsoft.Consumption/budgets API (2023-11-01):
+- Amount: $100/mo, Monthly grain, 2026-05-01 → 2027-05-01
+- Notifications at 50%, 80%, 100% actual spend → owner email (xam3002@hotmail.com)
+- Verified with `az consumption budget list --resource-group art-guide-prod-rg`
+- Note: legacy `art-guide-prod-budget` at $50 also exists (not removed)
+
+**Task C.2 — Cost dashboard docs.**
+
+Added "Cost monitoring" section to `docs/deployment.md` with portal URL, CLI queries, budget notes.
+
