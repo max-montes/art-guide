@@ -239,3 +239,6 @@ or the dump-adapter tests.
 - Rijks v1 PD ceiling: ~6,590 records (OAI-PMH set 261208, 149 pages).
 - Next coverage unlock: AIC dump adapter using the real S3 tarball (currently walks 10 sample records only).
 - Met remains forbidden on laptop. Coverage growth beyond AIC dump requires off-laptop infra (Container Apps job).
+
+### 2026-05-17T07:30: backend-engineer ported D-060 resume-skip pattern to met_csv.py
+- D-062 filed: Met v2 adapter now has `--resume-skip-existing` parity with AIC/Rijks v1 adapters. Enables safe ACA Job restarts without re-embedding.

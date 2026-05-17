@@ -1243,3 +1243,76 @@ Projection for 200K records: ~110 min image-bound, total <2 hr (async I/O overla
 **What:** AIC v1 yields ~14,504 public-domain records via the public API (not the ~81K initially projected — `is_public_domain=true` + image-availability filters cut ~70%). Rijks v1 via OAI-PMH set 261208 yields ~6,590 PD records.
 **Why:** Future ingest planning should treat these as fixed ceilings for the v1 path. To grow coverage, dispatch ML to (a) finish the AIC dump adapter using the S3 tarball, or (b) move large jobs off-laptop (Met via Azure Container Apps job).
 **Impact on Phase 1 ingest:** v1 paths are now exhausted at 21,194 total records (aic=14,504, rijks=6,590, met=100). No further gains from the public API adapters. Next unlock is AIC dump adapter (2.5 GB S3 tarball) or moving large-scale work to Container Apps.
+
+## D-062 — Met ingest via Azure Container Apps Job (met-dump path)
+
+**Date:** 2026-05-17  
+**Owner:** backend-engineer  
+**Status:** Active
+
+Switch the existing `art-guide-prod-ingest` ACA Job from the v1 API path (`ingest met`) to the v2 CSV dump path (`ingest met-dump`) and add `--resume-skip-existing` support to `met_csv.py`.
+
+**Entrypoint command:**
+```
+art-guide-ml ingest met-dump \
+  --limit 0 \
+  --request-delay 0.015 \
+  --batch-commit-size 64 \
+  --batch-size 4 \
+  --resume-skip-existing
+```
+
+**Why:**
+- **Laptop is blocked.** Met's per-IP throttle (~80 req/s) plus multi-hour cooldowns make residential-IP ingest unreliable at 501K-record scale.
+- **Azure egress IP was also in penalty box** from prior D-052 parallel-ingest experiments. The ACA Job is the right long-term answer.
+- **v2 CSV dump path cuts API calls ~50%.** The `MetObjects.csv` pre-filter rejects non-PD + denylist records before any `/objects/{id}` call, reducing required API calls from ~501K to ~250K.
+- **`--resume-skip-existing` is now ported to `met_csv.py`** (D-060 pattern). A restarted job skips already-embedded IDs, making multi-restart runs cheap.
+
+**What changes:**
+
+| File | Change |
+|---|---|
+| `services/ml/ml/ingest/met_csv.py` | Added `_load_existing_source_ids()`, `resume_skip_existing` param to `ingest_met_csv_to_db()`, skip logic in the CSV loop, `skipped_existing` counter in `CSVIngestStats` |
+| `services/ml/ml/cli.py` | Added `--resume-skip-existing` arg to `met-dump` parser, pass flag to `ingest_met_csv_to_db()`, include `skipped_existing` in summary output |
+| `infra/azure/main.bicep` | Change: `command` array from `ingest met ...` → `ingest met-dump ... --resume-skip-existing`, image from `v4` → `latest` |
+| `docs/met-aca-job.md` | New operator runbook for Met via ACA Job |
+
+**Constraints honored:**
+- D-006 (catalog over model): new coverage via new ingest adapter ✓
+- D-013 (two environments only): job in `prod` only ✓
+- D-028 (SigLIP offline): `HF_HUB_OFFLINE=1` + `TRANSFORMERS_OFFLINE=1` ✓
+- D-053 (single-worker rate discipline): parallelism=1, request_delay=0.015 s ✓
+- D-060 (resume-skip pattern): ported to `met-dump` ✓
+- Hard rule #3 (no raw images): bytes in-memory only ✓
+- Hard rule #4 (one image pipeline): all via `ml.imageops.prepare_for_embedding` ✓
+
+**Handoff to Brady:**
+1. Review `docs/met-aca-job.md` (new operator runbook)
+2. Confirm DSN in `parameters.prod.json`
+3. IP cooldown check before running `az deployment group create`
+4. New image with `--resume-skip-existing` support ready in ACR
+
+**Cost:** ~$1.10–1.60 per full run (2 vCPU × 3.5 hr), within $100/mo budget alert.
+
+## D-063 — v1 AIC + Rijks adapters support `--resume-skip-existing`
+
+**Date:** 2026-05-17  
+**Owner:** ml-retrieval-engineer  
+**Status:** Active
+
+Both `art-guide-ml ingest aic` and `art-guide-ml ingest rijks` now accept a `--resume-skip-existing` boolean flag (default off). When set, on startup we load `SELECT source_id FROM artworks WHERE source = <slug>` into a Python `set[str]` and skip any record whose `source_id` is in the set. This avoids re-embedding already-ingested records on a restart. Listing-page API calls still happen (needed to discover IDs); the savings are one image GET + one SigLIP forward per skipped record.
+
+**Scope:** v1 live-API adapters only. v2 dump adapters (`met_csv.py`, `aic_dump.py`) already have natural resume via `--max-records` + idempotent UPSERT. The `met` v1 adapter (`met_db.py`) was not updated because it is currently IP-throttled (D-053) and unused.
+
+**Files touched:**
+- `services/ml/ml/ingest/aic_db.py` (+stats field, +loader, +flag, +guard)
+- `services/ml/ml/ingest/rijks_db.py` (+stats field, +loader, +flag, +guard)
+- `services/ml/ml/cli.py` (+flag wiring, summary line)
+- `services/ml/tests/test_aic_db.py` (+3 unit tests)
+- `services/ml/tests/test_rijks_db.py` (+2 unit tests)
+
+**Operator runbook delta:** restart of interrupted run is now `art-guide-ml ingest aic --database-url ... --limit 0 --request-delay 1.1 --batch-commit-size 64 --resume-skip-existing`.
+
+**Rationale:** Without this, restarting an interrupted ingest re-walks every listing page from page 1 and re-embeds existing records. Brady's overnight run with the flag added 10,099 AIC + 1,662 Rijks rows to completion in one shift.
+
+**Constraint conformance:** D-002, D-006, D-012, D-015, D-016, D-058.
