@@ -1357,3 +1357,91 @@ All 5 pre-deployment gates passed:
 The v2 CSV dump path pre-filters ~50% of Met's 501K rows before any `/objects/{id}` call, cutting throttle exposure and wall time vs. the v1 API path. Combined with single-worker discipline and `--resume-skip-existing`, this is the production-safe ingest strategy per D-053/D-054.
 
 **Constraint conformance:** D-015, D-016, D-018, D-023, D-053, D-054.
+
+## D-065 — Met ingest circuit breaker + request-rate fix
+
+**Date:** 2026-05-17  
+**Author:** backend-engineer  
+**Status:** Active
+
+### Problem
+
+Job `art-guide-prod-ingest` (execution `eins3l3`) ran for ~3 hours writing 0 rows.
+The container was alive and logs showed continuous 403s from the Met API — the Azure
+Container Apps egress IP had been IP-banned, exactly the scenario documented from
+the 2026-05-17T03:20Z incident.
+
+The code caught each 403 as `skipped_api_error` and continued silently.  No hard
+failure, no DB writes, ~$0.80 in ACA compute wasted.
+
+Compounding factor: `--request-delay 0.015` (66 req/s) was used instead of the
+conservative safe rate of ~10 req/s (0.1s delay).  At 11× the safe rate, the IP
+was likely re-banned within minutes of the job starting even though the pre-flight
+T-5 gate check showed HTTP 200.
+
+### Decisions
+
+#### 1. Ship a circuit breaker (`MetAPIBannedError`)
+
+Added to `services/ml/ml/ingest/met_csv.py` (commit 90bd6a0):
+
+- `_probe_met_api()` — called once before the main CSV loop.  Sends a single
+  GET /objects/{probe_id} and raises `MetAPIBannedError` immediately if the response
+  is 403.  Prevents starting the expensive CSV scan on a banned IP.
+- `DEFAULT_CONSECUTIVE_403_LIMIT = 50` — in-loop counter; if 50 consecutive
+  `/objects/{id}` calls all return 403, raises `MetAPIBannedError` with the last
+  object_id in the message.  Resets to 0 on any successful (non-403) response.
+- Both paths produce a log line naming the `curl` command to verify recovery.
+
+**Validation:** execution `fw140av` failed in ~50s with
+`Circuit breaker tripped: 50 consecutive 403s (last object_id 232)` instead of
+running 3+ hours.
+
+#### 2. Correct `--request-delay` in job definition
+
+Updated ACA job definition (`az containerapp job update --yaml`):
+`--request-delay 0.015` → `--request-delay 0.1` (10 req/s floor).  
+This is within the safe range per the Met published 80 req/s limit and reduces
+re-ban risk.
+
+Actual wall-time cost: ~250K eligible records × 0.1s floor + ~0.2s HTTP = ~1.25×
+longer than the prior estimate.  Revised ETA: ~5–6 hours (was 3–4 hours).
+Budget impact: negligible (a few extra cents of ACA compute).
+
+#### 3. Probe improvement (deferred)
+
+The upfront probe uses object ID 1 by default.  In the `fw140av` incident, object 1
+may have returned 200 or 404 while the rest of the API was 403, so the probe passed
+and the circuit breaker caught it instead.  A follow-up improvement: probe a
+confirmed PD object (e.g., 436523 — confirmed in DB) or probe 3–5 IDs and require
+all to be non-403.  Deferred as a polish item; the 50-consecutive circuit breaker
+provides an adequate safety net.
+
+### Current state (2026-05-17T23:10Z)
+
+- Execution `eins3l3` stopped manually at 22:40Z (0 rows written, ~$0.64 wasted).
+- Execution `fw140av` failed fast at 23:05Z (circuit breaker; 0 rows written).
+- ACA egress IP still banned.  IP has been banned since ~19:55Z (~3h15m); prior
+  cooldown was ~3h.  The fw140av run added a short additional burst.
+- **Recommended restart time:** ~01:00Z (Monday).  Before starting, confirm with:
+
+  ```bash
+  # Run FROM a container in the same ACA environment (or accept that the circuit
+  # breaker will fail fast if still banned):
+  az containerapp job start -g art-guide-prod-rg -n art-guide-prod-ingest
+  # If circuit breaker fires within 60s → IP still banned → wait longer.
+  # If job runs and rows accumulate → good.
+  ```
+
+- DB state: 21,194 rows (100 met, 14,504 aic, 6,590 rijks).  The 100 met rows
+  (IDs 436523–436642) are from a prior test run and will be skipped by
+  `--resume-skip-existing` on the next run.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `services/ml/ml/ingest/met_csv.py` | Circuit breaker (`MetAPIBannedError`, `_probe_met_api`, `DEFAULT_CONSECUTIVE_403_LIMIT=50`) — commit 90bd6a0 |
+| ACA job definition (live) | `--request-delay` 0.015 → 0.1 |
+
+**Constraint conformance:** D-002, D-006, D-015, D-016, D-023, D-054.

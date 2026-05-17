@@ -90,3 +90,21 @@ az containerapp revision restart --name art-guide-prod-api -g art-guide-prod-rg 
   - **IP state at 23:10Z:** Still banned. Do not restart until 01:00Z at earliest. Start the job — if the IP is clear, it will run; if not, the circuit breaker will fail in <60s.
   - **Probe limitation noted:** The upfront probe checks object ID 1. If that specific object returns 404 (not PD or non-existent), the probe won't catch a full IP ban; the circuit breaker at 50 consecutive 403s will still catch it. Consider using a known PD object (e.g., 436523) as the probe target in a future improvement.
 
+
+## Met ingest circuit breaker + rate fix — 2026-05-17T23:09:26Z
+
+**Session:** Scribe processed backend-engineer's ingest diagnosis.
+
+**Status update:**
+- D-065 committed to decisions log: circuit breaker deployed, request delay corrected from 66 req/s → 10 req/s.
+- Met API IP still banned; recovery expected ~01:00Z UTC (Monday).
+- Circuit breaker (`MetAPIBannedError`) validated: execution `fw140av` failed cleanly in 50s vs. prior 3h silent drain.
+- **Safe rate confirmed:** 10 req/s (0.1s delay) per Met API 80 req/s documentation; 0.1s margin applied.
+- DB state stable: 21,194 rows (100 met, 14,504 aic, 6,590 rijks). Resumption will skip existing via `--resume-skip-existing` flag.
+- Heartbeat v2 (15m interval) monitors for circuit-breaker patterns; escalates if 4+ trips within 1h.
+
+**Lessons consolidated:**
+1. Met API bans operate at IP level, not request level. 403 flatline = IP ban; 429 + intermittent 200s = rate limit.
+2. Pre-flight gate (T-5 HTTP 200 from Met) can pass even if IP about to be banned; post-gate burst can trigger ban within seconds if rate is unsafe.
+3. Circuit breaker cost-benefit: detects ban state in <60s, preventing hours of wasted compute. Probe logic (object ID 1) works but can be sharpened with known-PD object in follow-up.
+
