@@ -1,0 +1,25 @@
+// Config.xcconfig
+//
+// Build-time configuration for ArtGuide. These values are surfaced to the
+// running app via Info.plist (see API_BASE_URL / API_KEY entries there) and
+// read at runtime by AppConfig.
+//
+// xcconfig gotcha: a double-slash starts a comment, even inside a value.
+// Use `$()` to break up the `//` in URLs:
+//     API_BASE_URL = https:/$()/api.dev.artguide.example
+//
+// Default configuration (these are overridden by Config.local.xcconfig if present).
+API_BASE_URL = http:/$()/localhost:8000
+API_KEY      = dev-replace-me
+
+// Local overrides: place Config.local.xcconfig next to this file (gitignored).
+// It must be included LAST so its values override the defaults above.
+//   1. Create Config.local.xcconfig with:
+//        API_BASE_URL = https:/$()/your-api.example
+//        API_KEY      = your-bearer-token
+//   2. This include will apply those overrides automatically.
+#include? "Config.local.xcconfig"
+
+// The Info.plist values must NOT be wrapped in quotes; the strings are
+// substituted as-is. Keep these keys flat (no whitespace) to avoid
+// xcconfig parsing surprises.
