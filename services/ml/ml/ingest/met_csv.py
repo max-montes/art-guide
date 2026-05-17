@@ -80,6 +80,26 @@ from ml.ingest.met_db import (
 logger = logging.getLogger("ml.ingest.met_csv")
 
 
+# ----------------------------------------------------------------- exceptions
+
+
+class MetAPIBannedError(RuntimeError):
+    """Raised when the Met API returns enough consecutive 403s to indicate
+    an IP-level ban rather than a per-record permission issue.
+
+    This is a fast-fail safeguard: the job exits with a clear error instead
+    of burning hours scanning ~250K CSV records and writing 0 rows.
+
+    Recovery: wait for the Azure Container Apps egress IP to exit the Met
+    penalty box (typically 1–3 hours), then re-run the job.  Verify with::
+
+        curl -s -o /dev/null -w "%{http_code}" \\
+            https://collectionapi.metmuseum.org/public/collection/v1/objects/1
+
+    Expect HTTP 200 before restarting.
+    """
+
+
 # ----------------------------------------------------------------- constants
 
 MET_CSV_URL = (
@@ -88,6 +108,12 @@ MET_CSV_URL = (
 )
 DEFAULT_CACHE_MAX_AGE_DAYS = 7
 DEFAULT_EMBED_BATCH_SIZE = 8
+
+# Circuit-breaker threshold: if this many consecutive /objects/{id} calls
+# return 403, abort the run immediately via MetAPIBannedError.  A ban hits
+# every single ID instantly; a legitimate per-record 403 (retired/private
+# object) would be isolated with 200s around it.
+DEFAULT_CONSECUTIVE_403_LIMIT = 50
 
 # Classification denylist — applied case-insensitively. Records whose
 # `Classification` (or fallback `Object Name`) contain any of these tokens
@@ -384,6 +410,36 @@ async def _get_with_retry(
             await asyncio.sleep(sleep_s)
 
 
+async def _probe_met_api(
+    client: httpx.AsyncClient,
+    base_url: str,
+    probe_id: int = 1,
+) -> None:
+    """Make a single cheap probe request to confirm the Met API is reachable.
+
+    Raises ``MetAPIBannedError`` immediately if the probe returns 403,
+    rather than letting the caller discover it record-by-record over hours.
+    Use a well-known public-domain object (default: object 1, which is
+    reliably indexed) so the probe itself is representative.
+    """
+    url = f"{base_url.rstrip('/')}/objects/{probe_id}"
+    try:
+        resp = await client.get(url)
+    except httpx.HTTPError as exc:
+        logger.warning("Met API probe failed (network): %s", exc)
+        return  # network blip — let the main loop handle it
+    if resp.status_code == 403:
+        raise MetAPIBannedError(
+            f"Met API probe returned 403 for {url}. "
+            "The Azure Container Apps egress IP is likely in the Met penalty "
+            "box. Wait 1–3 hours and verify with: "
+            f"curl -s -o /dev/null -w '%{{http_code}}' {url}"
+        )
+    if resp.status_code not in (200, 404):
+        # 404 = object not found but API is up; non-403 4xx/5xx = warn only.
+        logger.warning("Met API probe returned HTTP %d for %s", resp.status_code, url)
+
+
 async def _fetch_object_json(
     client: httpx.AsyncClient,
     base_url: str,
@@ -589,12 +645,17 @@ async def ingest_met_csv_to_db(
         follow_redirects=True,
     ) as client:
 
+        # Upfront probe: fail fast if the Azure egress IP is already banned.
+        # Avoids burning hours scanning 250K CSV records with 0 writes.
+        await _probe_met_api(client, base_url)
+
         # Pending batch of (mapped_row, image_bytes) tuples waiting for the
         # next embed call. Once we hit ``embed_batch_size``, we run a single
         # SigLIP forward pass against all of them.
         embed_pending: list[tuple[dict[str, Any], bytes]] = []
         commit_batch: list[dict[str, Any]] = []
         embedded_so_far = 0
+        consecutive_403s = 0  # circuit-breaker counter
 
         async def _flush_embed_batch() -> None:
             """Embed all pending images in a single forward pass, then
@@ -673,10 +734,28 @@ async def ingest_met_csv_to_db(
                 raw = await _fetch_object_json(
                     client, base_url, object_id, stats=stats
                 )
-            except httpx.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code == 403:
+                    consecutive_403s += 1
+                    if consecutive_403s >= DEFAULT_CONSECUTIVE_403_LIMIT:
+                        raise MetAPIBannedError(
+                            f"Circuit breaker tripped: {consecutive_403s} consecutive "
+                            "403s from the Met API (last object_id "
+                            f"{object_id}). Azure egress IP is likely IP-banned. "
+                            "Wait 1–3 hours, verify HTTP 200 from the ACA egress IP, "
+                            "then restart the job."
+                        ) from exc
+                else:
+                    consecutive_403s = 0
                 logger.warning("met %s /objects fetch failed: %s", object_id, exc)
                 stats.skipped_api_error += 1
                 continue
+            except httpx.HTTPError as exc:
+                consecutive_403s = 0
+                logger.warning("met %s /objects fetch failed: %s", object_id, exc)
+                stats.skipped_api_error += 1
+                continue
+            consecutive_403s = 0  # reset on success
             stats.fetched += 1
 
             mapped = map_met_record(raw)
@@ -715,9 +794,11 @@ async def ingest_met_csv_to_db(
 __all__ = [
     "CSVIngestStats",
     "DEFAULT_CACHE_MAX_AGE_DAYS",
+    "DEFAULT_CONSECUTIVE_403_LIMIT",
     "DEFAULT_DENYLIST_EXACT",
     "DEFAULT_DENYLIST_SUBSTRINGS",
     "DEFAULT_EMBED_BATCH_SIZE",
+    "MetAPIBannedError",
     "MET_CSV_URL",
     "ensure_met_csv",
     "get_cache_dir",
