@@ -516,3 +516,36 @@ The Phase 1 critical path requires real catalog data in prod before iOS integrat
 **Why OSAllocatedUnfairLock (not actor):** `MockAPIClient` is `final class` conforming to `APIClientProtocol`. Its mutable properties (`scenario`, `forcedResponse`, `forcedError`, `simulatedLatency`) are accessed synchronously from previews and tests. Converting to `actor` would require `await` at every property access. `OSAllocatedUnfairLock<State>` is async-safe, available on iOS 16+ (matches deployment target), and requires zero call-site changes.
 
 **Result:** `BUILD SUCCEEDED`, 0 errors, 0 warnings, 13/13 tests pass.
+
+## D-032 — XcConfig Include Order (Config.xcconfig)
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** Brady's iPhone shipped with `localhost:8000` + "dev-replace-me" API key instead of prod overrides from `Config.local.xcconfig`. The local file was correctly populated, but its values were being overwritten by the defaults.
+
+**Root cause:** In `apps/ios/ArtGuide/Config/Config.xcconfig`, the `#include? "Config.local.xcconfig"` line appeared **before** default assignments. In xcconfig merge semantics, later assignments win, so the defaults **after** the include were overriding the included values—backwards.
+
+**Fix:** Moved `#include?` to the **end** of Config.xcconfig, after all defaults. Now the included file's values override the defaults as intended. Updated comments to clarify the ordering requirement.
+
+**Verification:** Build succeeded; `xcodebuild -showBuildSettings` confirmed `API_BASE_URL` = prod URL (not localhost) and `API_KEY` = 48 chars (not "dev-replace-me").
+
+**Constraint conformance:** D-011 (local + prod only).
+
+## D-033 — iOS cold-start tolerance: 60/90 s timeouts + /healthz pre-warm on camera appear
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** Brady hit "Could not connect to the server" on first `/identify` call from a real iPhone. Root cause: Azure Container Apps scales to zero after ~20 min idle (D-028). SigLIP model load on cold start takes 10–30 s (D-028 operational note). Default URLSession timeout was firing before the container responded.
+
+**Decision:**
+
+1. **Timeout values:** `APIClient` creates its own `URLSession` (instead of using `.shared`) with:
+   - `timeoutIntervalForRequest = 60` — max inactivity per read/write segment
+   - `timeoutIntervalForResource = 90` — total request lifetime
+   - `/identify` URLRequest explicitly sets `timeoutInterval = 60` as belt-and-suspenders
+
+2. **Warmup strategy:** Added `warmup()` to `APIClientProtocol` (default no-op via protocol extension, so `MockAPIClient` unchanged). `APIClient.warmup()` fires `GET /healthz` with 30 s timeout and swallows all errors. Warmup called from `RootView.onAppear` (camera view appears) via `Task { await session.client.warmup() }`. Container wakes while user is looking at capture UI; model is loaded before photo is taken.
+
+**Files changed:** `APIClient.swift` (timeouts, warmup method, protocol extension), `Endpoints.swift` (healthz path), `RootView.swift` (onAppear warmup invocation).
+
+**Verification:** BUILD SUCCEEDED, 13/13 tests pass. Committed (0a62f8b).
+
+**Constraint conformance:** D-028 (Dockerfile v1 — healthz endpoint), D-007 (API contract — /healthz ops endpoint).

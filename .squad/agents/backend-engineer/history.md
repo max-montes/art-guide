@@ -66,3 +66,7 @@ See `history-archive.md` for Phase 0 foundation work (endpoint scaffolding, erro
 ## Cross-Agent Note — 2026-05-16 (ios-engineer outcome)
 
 **iOS app build is now green (13 tests passing, zero warnings).** Brady fixed two blockers: (1) stale `.xcodeproj` regenerated via xcodegen, (2) MockAPIClient NSLock → OSAllocatedUnfairLock for async safety. Brady is now testing on simulator against live prod. Watch for any API contract issues he surfaces (e.g., multipart handling, response shape, error codes).
+
+## Cross-Agent Note — 2026-05-16 (ios-engineer — cold-start hardening)
+
+**iOS now warms `/healthz` before `/identify` (D-033).** The camera view (RootView) fires a background `GET /healthz` on appear, so the container wakes + model loads while the user is looking at the UI. Combined with raised timeouts (60s per-segment, 90s total), this mitigates the cold-start latency observed in D-028. Expect occasional unprovoked `/healthz` traffic from the app — that's intentional.
