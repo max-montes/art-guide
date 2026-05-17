@@ -485,3 +485,147 @@ It does **not** prohibit a native iOS app from caching the user's own photo on t
 **Decision:** `main.bicep` must expose `apiImage`, `apiCpu`, `apiMemory`, `containerPort` as params with live-prod-matching defaults. `parameters.prod.json` must explicitly set all four. `deploy.sh` must run `what-if` before every deploy and hard-fail if it would write a hello-world/placeholder image. See `.squad/decisions/inbox/backend-engineer-bicep-image-param.md` for full detail.
 
 **Current live state:** revision `art-guide-prod-api--0000006`, image `artguideprodcr.azurecr.io/art-guide-api:v2` (Wave 2 museum-plaque prompt, D-036 shipped).
+
+## D-039 — Wave 2 Museum-Plaque LLM Prompt
+**Date:** 2026-05-16 | **Owner:** backend-engineer | **Status:** Shipped
+
+**Decision:** Wave 2 of the museum-plaque LLM prompt is shipped. The system and status guardrails were rewritten to instruct `gpt-5-mini` to weave tier-(a) enrichment fields (artist_bio, credit_line, dimensions, dynasty) into warm curator prose.
+
+**Voice:** "museum curator writing a wall-plaque" with knowledgeable but warm docent tone — NOT marketing copy, NOT "helpful assistant."
+
+**Per-status behavior:**
+- **Exact / high_confidence:** Prompt instructs weaving of `artist_bio` + `credit_line` into prose. Dimensions mentioned only if notably large/small (size heuristic left to model judgment given the guardrail). Dynasty/period leads for non-Western works.
+- **Likely:** Same enrichment weave + hedging language ("This appears to be…").
+- **Style_only:** Strictly no artwork naming. Resemblance framing only ("resembles the work of X").
+- **No_match:** Canned docent phrasing: "I can't place this one — could be a private work, a reproduction, or just outside what I know." No LLM call.
+
+**gpt-5-mini constraints discovered:**
+- `temperature` param rejected (hard API error) — removed entirely.
+- `max_tokens` → `max_completion_tokens` (API error otherwise).
+- Internal reasoning consumes ~700 tokens; `max_completion_tokens=1500` needed to leave room for prose output. With 250, output was empty (finish_reason=length, all tokens to reasoning).
+
+**Smoke test:** Record L'Arlésienne (Van Gogh, met:436529) with title, artist, date, medium, museum, artist_bio, credit_line, dimensions passed to LLM. Output: "Vincent van Gogh (Dutch, Zundert 1853–1890 Auvers-sur-Oise) painted L'Arlésienne: Madame Joseph-Michel Ginoux (Marie Julien, 1848–1911) in 1888–89 in oil on canvas. The painting is in The Metropolitan Museum of Art and entered the collection as the bequest of Sam A. Lewisohn in 1951." Dimensions (36×29 in.) correctly skipped — average-sized work.
+
+**Files changed:** `services/api/app/llm.py` — prompt constants + LLM kwargs. All 73 existing API tests pass.
+
+**Prod deployment:** The new code is committed to `master`. Activating it in prod requires an ACR image rebuild (`az acr build`) + Container App revision update — same procedure as D-028. The prompt changes are backward-compatible (no schema changes).
+
+**Constraint conformance:** D-007 (API contract), D-012 (privacy), D-026 (plaque UX), D-027 (enrichment shipped).
+
+## D-040 — Cost Controls — Budget Alert + Dashboard Docs
+**Date:** 2026-05-16 | **Owner:** backend-engineer | **Status:** Active
+
+**Decision:** Azure consumption budget alert and cost-monitoring documentation added for `art-guide-prod-rg`.
+
+1. **Budget:** `art-guide-prod-monthly` created via `az rest PUT` against `Microsoft.Consumption/budgets` API (2023-11-01). Amount: $100/mo, Monthly grain, 2026-05-01 → 2027-05-01. Alerts at 50%, 80%, 100% actual spend → owner email.
+2. **Legacy budget:** `art-guide-prod-budget` at $50/mo also exists (pre-existing, not removed).
+3. **Cost monitoring docs:** "Cost monitoring" section added to `docs/deployment.md` with direct portal URL, CLI queries for MTD spend by service, and budget verification commands.
+4. **Portal URL pattern:** `https://portal.azure.com/#@{tenantId}/resource/subscriptions/{subId}/resourceGroups/art-guide-prod-rg/costAnalysis`
+
+**Files changed:** `docs/deployment.md` — "Cost monitoring" section appended.
+
+**Constraint conformance:** D-011 (deployment shape — $50/mo budget alert).
+
+## D-041 — Container Apps Job for Full Met Catalog Ingest
+**Date:** 2026-05-16 | **Owner:** ml-retrieval-engineer | **Status:** Active
+
+**Problem:** The prod Postgres is seeded with only 100 records (D-029). Scaling to the full ~500K Met Open Access catalog requires a long-running compute job (estimated 20–23 hours at 6 req/s with Met's rate floor). Running this from a developer's laptop is impractical for ~500K records. A managed job resource on the same Container Apps Environment eliminates local dependency and integrates cleanly with the existing CI/CD pattern.
+
+**Decision:** Add `Microsoft.App/jobs` resource (`art-guide-prod-ingest`) to `infra/azure/main.bicep` as a sibling of the API container app on the same Container Apps Environment (`art-guide-prod-cae`).
+
+**Job spec:**
+- **Image:** `artguideprodcr.azurecr.io/art-guide-api:v1` — same image as the API; no separate build.
+- **CMD override:** `art-guide-ml ingest met --limit 0 --batch-commit-size 64`
+- **Trigger type:** `Manual` (not scheduled). Brady initiates via `az containerapp job start`.
+- **replicaTimeout:** 7200 s (2 hr per Azure op timeout; the actual job takes ~23 hr but Azure tracks execution, not just the provision timeout)
+- **replicaRetryLimit:** 1
+- **CPU/memory:** 2 vCPU / 4 Gi — headroom for SigLIP model load + batch encode loop
+- **Identity:** System-assigned managed identity with AcrPull + KV Secrets User RBAC wired via Bicep
+- **DATABASE_URL:** Injected via `secretRef: 'database-url'` (same as API secret; computed from `postgres.properties.fullyQualifiedDomainName` + KV secret)
+- **Environment vars:** `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, `HF_HOME=/opt/hf-cache` — forces SigLIP load from the baked-in model cache (D-028), no HuggingFace download at runtime
+
+**Corpus count (2026-05-16T17:22 PDT):** `https://collectionapi.metmuseum.org/public/collection/v1/objects?isPublicDomain=true` returned **501,696 public-domain records**. Upward drift from 492K estimate is normal (Met adds records regularly).
+
+**Cost estimate:** ~$1–2 total. 2 vCPU / 4 Gi Container Apps job pricing is ~$0.000012/vCPU-s + $0.000003/GiB-s. At 23 hours: ≈ ~$2.
+
+**First execution:** `art-guide-prod-ingest-brsioxp` — started 2026-05-17T00:51:42Z. Status: Running (full catalog pass; estimated ~23 hrs at 6 req/s Met rate floor).
+
+**Ingest idempotency:** The existing `ON CONFLICT (source, source_id) DO UPDATE` logic (D-018) means re-running the job on an already-seeded catalog is safe — duplicates upsert, not insert.
+
+**Constraint conformance:** D-002 (retrieval-first), D-004 (Met Phase 1), D-006 (single image pipeline), D-011 (two environments), D-012 (no raw images), D-015 (SigLIP-base-224), D-018 (met ingest pipeline).
+
+## D-042 — Error Screen Polish (follow-up to D-035)
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** Brady tested the debug build and saw ~10 lines of raw NSError text rendered inline under the headline "Couldn't identify that photo" for a `.decoding` error. The detection was correct; the UX was not.
+
+Two bugs:
+1. `ErrorView` used a single static headline regardless of error case — wrong framing for network/decode errors.
+2. `APIError.userFacingMessage` embedded `#if DEBUG` raw error text directly, so it appeared verbatim in the view body.
+
+**Decision:**
+- **`APIError.headline`** (new): per-case user-facing title. Each error case maps to a distinct phrase that reflects the cause (not just "Couldn't identify that photo", which is only correct for genuine `no_match` from a 200 response). Mapping tested and locked in `APIErrorTests`.
+- **`APIError.debugDetail`** (new): raw technical text (decode error string, URLError code+message, TLS code, HTTP body) extracted from `userFacingMessage` into a dedicated `String?` property. `nil` when there is nothing specific to show.
+- **`userFacingMessage`**: stripped of all `#if DEBUG` branches. Always returns clean, actionable copy in all build flavors.
+- **`ErrorView`**: renders `error.headline` as title. In `#if DEBUG` builds, shows a collapsed `DisclosureGroup("Details")` below the body when `debugDetail` is non-nil. In release builds, the disclosure is absent entirely.
+
+**Rule established:** "Couldn't identify that photo" is reserved for the genuine `no_match` result from a successful 200 response (handled in `NoMatchView`). Error screens must not reuse it.
+
+**Headline → case mapping:**
+- `.networkUnreachable` → "No internet connection"
+- `.cannotFindHost/.cannotConnect` → "Can't reach the museum"
+- `.timedOut` → "The server is waking up…"
+- `.tlsFailure` → "Secure connection failed"
+- `.decoding` → "Something went wrong"
+- `.http(5xx)` → "The museum server hit a problem"
+- `.http(401/403)` → "Authentication problem"
+
+**Constraint conformance:** D-005 (confidence-aware UX), D-007 (API contract — error responses).
+
+## D-043 — iOS Typed APIError Cases for Network Failures
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** `APIError.transport(String)` was a grab-bag that swallowed distinct `URLError` codes. After the cold-start debugging session (D-028, D-033), Brady reported that "Could not connect to the server" (Apple's default string for `.timedOut`) masked both a timeout and a configuration bug. Precise error cases make diagnosis faster and allow targeted user copy.
+
+**Decision:** Expand `APIError` to include:
+- `.networkUnreachable`, `.cannotFindHost`, `.cannotConnect`, `.timedOut`, `.tlsFailure(code:)` mapped from `URLError` via `APIError.map(_:)`.
+- Keep `.transport(String, code:)` as fallthrough (not removed — still needed for non-URLError errors).
+- `userFacingMessage` branches per case: `.timedOut` → cold-start language; 5xx → "museum server hit a problem"; TLS → short actionable copy.
+- DEBUG builds show raw code + message for rapid diagnosis.
+
+**Constraint conformance:** D-042 (error screen polish — per-case headlines).
+
+## D-044 — Staged Cold-Start Loading Messages
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** Brady reported 22s wall-time on a cold `/identify`. The existing `LoadingView` only said "This usually takes a few seconds." — incorrect and anxiety-inducing at 20s.
+
+**Decision:** Three-stage escalating message beneath the spinner:
+- 3s: "Waking up the museum…"
+- 10s: "Almost ready — first match takes a bit longer…"
+- 25s: "Still working on it — feel free to keep the camera steady…"
+
+Thresholds as named constants (`LoadingMessageThreshold`) — tunable without view surgery. Implemented as a cancellable `Task` in `identify()`, cancelled in `defer {}` so messages clear on any outcome.
+
+**Rules:** Never say "cold-start", "container", or "server". Warm museum metaphor only.
+
+**Constraint conformance:** D-033 (60/90 s timeouts — provides context for these message timings).
+
+## D-045 — Committed `.githooks/pre-commit` for XcodeGen Drift Prevention
+**Date:** 2026-05-16 | **Owner:** ios-engineer | **Status:** Active
+
+**Problem:** The xcodegen drift issue (D-030) occurred twice (2026-05-10, 2026-05-16). Each time, a new Swift file was added without rerunning `xcodegen generate`, causing a cascade of "Cannot find X in scope" errors. Documentation-only prevention (README callout + SKILL.md `⚠️ CRITICAL` heading) was insufficient.
+
+**Decision:** Implement a committed `.githooks/pre-commit` hook:
+- Detects staged `.swift` files under `apps/ios/` via `git diff --cached`.
+- If found, runs `xcodegen generate --quiet` from `apps/ios/`.
+- Stages the updated `ArtGuide.xcodeproj` automatically (`git add`).
+- Fails loudly if `xcodegen` is not installed, with the install command.
+
+**Install approach:** `.githooks/` directory committed to the repo + `setup-hooks.sh` at repo root that runs `git config core.hooksPath .githooks`. Chose this over:
+- husky: adds Node.js dependency, overkill for a native iOS project
+- `.git/hooks/`: not committed, requires manual per-clone setup, invisible to future devs
+
+**Rationale:** Hook is discoverable (visible in git history), self-documenting, and cross-platform (bash). Install is a one-liner. Failure is loud and includes the fix.
+
+**Constraint conformance:** D-030 (XcodeGen regen protocol — elevates from documentation to automated enforcement).
