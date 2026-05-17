@@ -1,5 +1,47 @@
 # iOS Engineer History (Current)
 
+## 2026-05-16 — Error Screen Polish (follow-up to B.1/B.2)
+
+### What changed
+
+**Files:** `apps/ios/ArtGuide/Models/APIError.swift`, `apps/ios/ArtGuide/Views/RootView.swift`, `apps/ios/ArtGuideTests/APIErrorTests.swift`
+
+Brady reported that the `.decoding` error showed a wall of raw NSError text directly under the headline in the debug build. Root causes:
+
+1. `ErrorView` used a single generic headline ("Couldn't identify that photo") for every error — wrong for network/decode errors.
+2. `userFacingMessage` embedded `#if DEBUG` raw error text directly, so it rendered as-is in the view body.
+
+**Fixes:**
+
+- Added `APIError.headline: String` — per-case user-facing title (see mapping table below).
+- Added `APIError.debugDetail: String?` — raw technical detail (decoded error text, URLError code, TLS code, HTTP body) extracted from `userFacingMessage` into a dedicated property.
+- `userFacingMessage` is now always clean in all build flavors. Removed all `#if DEBUG` blocks from it. `.decoding` now returns "The server sent a response I couldn't read."
+- `ErrorView` now renders `error.headline` as the title. In `#if DEBUG` builds, a collapsed `DisclosureGroup("Details")` below the body shows `debugDetail` when non-nil. In release builds, the disclosure is absent entirely.
+
+**Headline → case mapping (canonical, do not regress):**
+
+| `APIError` case | Headline |
+|---|---|
+| `.networkUnreachable` | "No internet connection" |
+| `.cannotFindHost` / `.cannotConnect` | "Can't reach the museum" |
+| `.timedOut` | "The server is waking up…" |
+| `.tlsFailure` | "Secure connection failed" |
+| `.transport` | "Network error" |
+| `.http(401/403)` | "Authentication problem" |
+| `.http(5xx)` | "The museum server hit a problem" |
+| `.http(other)` | "Server error" |
+| `.decoding` | "Something went wrong" |
+| `.rateLimited` | "Slow down" |
+| `.unauthorized` | "Authentication problem" |
+| `.payloadTooLarge` | "Photo too large" |
+| `.imageEncodingFailed` | "Photo problem" |
+| `.invalidRequest` | "Request error" |
+| `.cancelled` | "Upload cancelled" |
+
+**Tests:** 41 total pass (28 pre-existing + 13 new `headline` + `debugDetail` isolation tests). **Build:** SUCCEEDED.
+
+---
+
 ## 2026-05-16 — B.1 Error UX, B.2 Cold-Start Messages, C.3 XcodeGen Hook
 
 ### B.1 — Typed error enum + user-facing copy
