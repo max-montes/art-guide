@@ -103,4 +103,57 @@ final class APIErrorTests: XCTestCase {
     func test_userFacingMessage_cancelled() {
         XCTAssertEqual(APIError.cancelled.userFacingMessage, "Upload cancelled.")
     }
+
+    // MARK: - headline spot-checks (headline→case mapping must not regress)
+
+    func test_headline_networkUnreachable() {
+        XCTAssertEqual(APIError.networkUnreachable.headline, "No internet connection")
+    }
+
+    func test_headline_cannotFindHost() {
+        XCTAssertEqual(APIError.cannotFindHost.headline, "Can't reach the museum")
+    }
+
+    func test_headline_cannotConnect() {
+        XCTAssertEqual(APIError.cannotConnect.headline, "Can't reach the museum")
+    }
+
+    func test_headline_timedOut() {
+        XCTAssertEqual(APIError.timedOut.headline, "The server is waking up…")
+    }
+
+    func test_headline_tlsFailure() {
+        XCTAssertEqual(APIError.tlsFailure(code: -9807).headline, "Secure connection failed")
+    }
+
+    func test_headline_http401() {
+        XCTAssertEqual(APIError.http(status: 401, message: nil).headline, "Authentication problem")
+    }
+
+    func test_headline_http503() {
+        XCTAssertEqual(APIError.http(status: 503, message: nil).headline, "The museum server hit a problem")
+    }
+
+    func test_headline_decoding() {
+        XCTAssertEqual(APIError.decoding("raw error text").headline, "Something went wrong")
+    }
+
+    func test_headline_transport_fallthrough() {
+        XCTAssertEqual(APIError.transport("some error", code: -1).headline, "Network error")
+    }
+
+    // MARK: - debugDetail isolation (raw text must NOT appear in userFacingMessage)
+
+    func test_decoding_userFacingMessage_isClean() {
+        let raw = "DecodingError.dataCorrupted: Data was corrupted. NSDebugDescription=Unexpected character '<'"
+        let err = APIError.decoding(raw)
+        XCTAssertFalse(err.userFacingMessage.contains(raw),
+            "Raw decode error text must not appear in userFacingMessage")
+        XCTAssertEqual(err.userFacingMessage, "The server sent a response I couldn't read.")
+    }
+
+    func test_decoding_debugDetail_containsRawText() {
+        let raw = "DecodingError.dataCorrupted: bad JSON"
+        XCTAssertEqual(APIError.decoding(raw).debugDetail, raw)
+    }
 }

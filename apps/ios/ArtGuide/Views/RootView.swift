@@ -107,23 +107,47 @@ struct RootView: View {
     }
 }
 
-/// Minimal failure presentation. Lives here to keep `RootView` self-contained;
-/// promote to its own file if it ever grows.
+/// Failure screen. Headline and body are driven by `APIError.headline` /
+/// `APIError.userFacingMessage` so each error case gets its own title rather
+/// than the generic "Couldn't identify that photo" (which is only correct for
+/// genuine `no_match` from a 200 response).
+///
+/// In DEBUG builds a collapsible "Details" disclosure shows `debugDetail` for
+/// rapid diagnosis. In release builds the disclosure is hidden entirely.
 private struct ErrorView: View {
     let error: APIError
     let onRetry: () -> Void
+
+    @State private var detailsExpanded = false
 
     var body: some View {
         VStack(spacing: 24) {
             Image(systemName: "exclamationmark.triangle")
                 .font(.system(size: 56, weight: .light))
                 .foregroundStyle(.secondary)
-            Text("Couldn't identify that photo")
+
+            Text(error.headline)
                 .font(.title3.weight(.semibold))
+
             Text(error.userFacingMessage)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal)
+
+            #if DEBUG
+            if let detail = error.debugDetail {
+                DisclosureGroup("Details", isExpanded: $detailsExpanded) {
+                    Text(detail)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                }
+                .padding(.horizontal)
+            }
+            #endif
+
             Button("Try Again", action: onRetry)
                 .buttonStyle(.borderedProminent)
         }

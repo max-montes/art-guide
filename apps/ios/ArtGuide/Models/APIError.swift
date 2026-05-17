@@ -89,7 +89,76 @@ public enum APIError: Error, Equatable, Sendable {
         }
     }
 
-    // MARK: - User-facing copy
+    // MARK: - Per-case headline (title shown in ErrorView)
+
+    /// Short headline for the error screen title. Each case maps to a distinct,
+    /// user-facing phrase so the title reflects the *cause*, not just the symptom.
+    public var headline: String {
+        switch self {
+        case .payloadTooLarge:
+            return "Photo too large"
+        case .imageEncodingFailed:
+            return "Photo problem"
+        case .invalidRequest:
+            return "Request error"
+        case .networkUnreachable:
+            return "No internet connection"
+        case .cannotFindHost, .cannotConnect:
+            return "Can't reach the museum"
+        case .timedOut:
+            return "The server is waking up…"
+        case .tlsFailure:
+            return "Secure connection failed"
+        case .transport:
+            return "Network error"
+        case .http(let status, _):
+            switch status {
+            case 401, 403: return "Authentication problem"
+            case 500...599: return "The museum server hit a problem"
+            default: return "Server error"
+            }
+        case .rateLimited:
+            return "Slow down"
+        case .decoding:
+            return "Something went wrong"
+        case .unauthorized:
+            return "Authentication problem"
+        case .cancelled:
+            return "Upload cancelled"
+        }
+    }
+
+    // MARK: - Debug detail (shown in collapsible DisclosureGroup, hidden in release)
+
+    /// Raw technical detail suitable for a debug disclosure panel.
+    /// `nil` when there is nothing more specific to show.
+    /// Always `nil`-check before rendering — never show this text to users directly.
+    public var debugDetail: String? {
+        switch self {
+        case .decoding(let detail):
+            return detail
+        case .transport(let detail, let code):
+            if let code {
+                return "URLError code \(code): \(detail)"
+            }
+            return detail
+        case .tlsFailure(let code):
+            return "TLS error code: \(code)"
+        case .http(let status, let message):
+            if let message, !message.isEmpty {
+                return "HTTP \(status): \(message)"
+            }
+            return "HTTP \(status)"
+        case .invalidRequest(let detail):
+            return detail
+        case .payloadTooLarge(let actual, let max):
+            return "Actual: \(actual) bytes, max: \(max) bytes"
+        default:
+            return nil
+        }
+    }
+
+    // MARK: - User-facing body copy (always clean — no raw error text)
 
     public var userFacingMessage: String {
         switch self {
@@ -113,41 +182,20 @@ public enum APIError: Error, Equatable, Sendable {
         case .timedOut:
             return "The server is waking up. Please try again in a moment."
 
-        case .tlsFailure(let code):
-            #if DEBUG
-            return "TLS/SSL failure (code \(code)). Check the server certificate."
-            #else
+        case .tlsFailure:
             return "Couldn't establish a secure connection. Please try again."
-            #endif
 
-        case .transport(let detail, let code):
-            #if DEBUG
-            if let code {
-                return "Network error (code \(code)): \(detail)"
-            }
-            return "Network error: \(detail)"
-            #else
-            _ = detail
-            _ = code
+        case .transport:
             return "A network problem prevented the request. Please try again."
-            #endif
 
-        case .http(let status, let message):
+        case .http(let status, _):
             switch status {
             case 401, 403:
                 return "Authentication problem — this is a bug, please report it."
             case 500...599:
                 return "The museum server hit a problem — try again in a moment."
             default:
-                #if DEBUG
-                if let message, !message.isEmpty {
-                    return "Server error (\(status)): \(message)"
-                }
                 return "Server error (\(status)). Please try again in a moment."
-                #else
-                _ = message
-                return "Server error (\(status)). Please try again in a moment."
-                #endif
             }
 
         case .rateLimited(let retryAfter):
@@ -159,13 +207,8 @@ public enum APIError: Error, Equatable, Sendable {
         case .unauthorized:
             return "Authentication problem — this is a bug, please report it."
 
-        case .decoding(let detail):
-            #if DEBUG
-            return "Got a confusing response from the server (decode error: \(detail))."
-            #else
-            _ = detail
-            return "Got a confusing response from the server. Tap Try Again."
-            #endif
+        case .decoding:
+            return "The server sent a response I couldn't read."
 
         case .cancelled:
             return "Upload cancelled."
