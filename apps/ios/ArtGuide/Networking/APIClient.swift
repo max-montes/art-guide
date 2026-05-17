@@ -10,6 +10,17 @@ public protocol APIClientProtocol: AnyObject, Sendable {
 
     /// Refresh metadata for a single artwork by id.
     func artwork(id: String) async throws -> ArtworkCandidate
+
+    /// Fire-and-forget GET /healthz to wake the container after a
+    /// scale-to-zero cold start (D-028). Failures are silently ignored —
+    /// a warmup miss must never block the identify flow.
+    func warmup() async
+}
+
+public extension APIClientProtocol {
+    /// Default no-op so `MockAPIClient` and any test doubles don't need to
+    /// implement warmup.
+    func warmup() async {}
 }
 
 /// Real network client. Talks to `AppConfig.apiBaseURL`, attaches the
@@ -33,11 +44,22 @@ final class APIClient: APIClientProtocol, @unchecked Sendable {
     init(
         baseURL: URL = AppConfig.apiBaseURL,
         apiKey: String = AppConfig.apiKey,
-        session: URLSession = .shared
+        session: URLSession? = nil
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
-        self.session = session
+        if let session {
+            self.session = session
+        } else {
+            // D-028: Azure Container Apps scales to zero after ~20 min idle.
+            // SigLIP model load on cold start adds 10–30 s before first byte.
+            // timeoutIntervalForRequest: 60 s covers per-segment inactivity.
+            // timeoutIntervalForResource: 90 s covers total request lifetime.
+            let config = URLSessionConfiguration.default
+            config.timeoutIntervalForRequest = 60
+            config.timeoutIntervalForResource = 90
+            self.session = URLSession(configuration: config)
+        }
     }
 
     // MARK: - identify
@@ -49,6 +71,9 @@ final class APIClient: APIClientProtocol, @unchecked Sendable {
         let boundary = "ArtGuideBoundary-\(UUID().uuidString)"
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // D-028: explicit per-request override mirrors the session config;
+        // belt-and-suspenders in case a caller injects a custom session.
+        request.timeoutInterval = 60
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -120,6 +145,19 @@ final class APIClient: APIClientProtocol, @unchecked Sendable {
             #endif
             throw APIError.decoding(String(describing: error))
         }
+    }
+
+    // MARK: - Warmup
+
+    /// Fire-and-forget GET /healthz to pre-warm the container after a
+    /// scale-to-zero cold start (D-028). Uses a shorter 30 s timeout since
+    /// this is opportunistic — failure is silently swallowed.
+    func warmup() async {
+        let url = baseURL.appendingPathComponent(Endpoints.healthz)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        _ = try? await session.data(for: request)
     }
 
     // MARK: - HTTP helpers
