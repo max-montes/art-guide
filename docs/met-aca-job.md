@@ -10,7 +10,7 @@
 
 | # | Unknown | Where to find it |
 |---|---------|------------------|
-| T-1 | **Database DSN** — the Postgres connection string used by the ingest job lives as a `database-url` secret in the Bicep definition (injected at deploy time from `parameters.prod.json` `dbUrl` param, which must be set by the operator). Verify it is the correct prod Flexible Server host + DB name + user + password. | `az keyvault secret show --vault-name art-guide-prod-kv --name db-url` or check `parameters.prod.json` |
+| T-1 | **Database DSN** — the Postgres connection string used by the ingest job lives as a `database-url` secret in the Bicep definition (injected at deploy time from `parameters.prod.json` `dbUrl` param, which must be set by the operator). Verify it is the correct prod Flexible Server host + DB name + user + password. | `az keyvault secret show --vault-name art-guide-prod-kv --name database-url` or check `parameters.prod.json` |
 | T-2 | **Met API key** — The Met Open Access API (`collectionapi.metmuseum.org`) does **not** require an API key as of 2026-05-17. No secret needed. If this changes, add a KV secret `met-api-key` and inject as `MET_API_KEY` env var. | [metmuseum.github.io](https://metmuseum.github.io/) |
 | T-3 | **ACR image tag to use** — this runbook uses `art-guide-api:latest`. Confirm the latest tag in ACR contains the `--resume-skip-existing` flag (shipped in this session). If not, build a new image first (see step 2 below). | `az acr repository show-tags --name artguideprodcr --repository art-guide-api -o table` |
 | T-4 | **ACA environment name** — Bicep sets it to `${prefix}-cae` = `art-guide-prod-cae`. Verify: `az containerapp env list -g art-guide-prod-rg -o table` |

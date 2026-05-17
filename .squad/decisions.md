@@ -1316,3 +1316,44 @@ Both `art-guide-ml ingest aic` and `art-guide-ml ingest rijks` now accept a `--r
 **Rationale:** Without this, restarting an interrupted ingest re-walks every listing page from page 1 and re-embeds existing records. Brady's overnight run with the flag added 10,099 AIC + 1,662 Rijks rows to completion in one shift.
 
 **Constraint conformance:** D-002, D-006, D-012, D-015, D-016, D-058.
+
+## D-064 — Met Dump Ingest Job Started in Prod
+
+**Date:** 2026-05-17  
+**Owner:** backend-engineer  
+**Status:** Active
+
+The `art-guide-prod-ingest` ACA Job has been updated from the v1 `met` API path to the v2 `met-dump` CSV path and started for the first full catalog run.
+
+### Job execution details
+
+| Field | Value |
+|-------|-------|
+| Execution ID | `art-guide-prod-ingest-eins3l3` |
+| Start time | 2026-05-17T19:47:44+00:00 |
+| Status | Running |
+| Command | `art-guide-ml ingest met-dump --limit 0 --request-delay 0.015 --batch-commit-size 64 --batch-size 4 --resume-skip-existing` |
+| Image | `artguideprodcr.azurecr.io/art-guide-api:latest` (HEAD 8544dc7) |
+| Expected completion | ~2026-05-17T23:00–23:47Z |
+
+### Gate outcomes
+
+All 5 pre-deployment gates passed:
+- T-1 DSN: present and valid (`database-url` in KV, host = `art-guide-prod-pg.postgres.database.azure.com`)
+- T-2 Met API key: not required
+- T-3 ACR image: `latest` tag at 8544dc7, includes `--resume-skip-existing`
+- T-4 ACA env: `art-guide-prod-cae` confirmed
+- T-5 IP cooldown: HTTP 200 from Met API
+
+### Implementation notes
+
+- Used `az containerapp job update --yaml` instead of Bicep redeploy to avoid the recurring `api-bearer-token` secret-reset bug (see history.md).
+- Runbook (`docs/met-aca-job.md`) T-1 gate references wrong secret name `db-url`; actual name is `database-url`. Runbook should be corrected.
+- Single worker, `request_delay=0.015s` (~66 req/s), under Met's 80 req/s per-IP cap.
+- `--resume-skip-existing` is on — safe to restart if job fails mid-run.
+
+### Rationale
+
+The v2 CSV dump path pre-filters ~50% of Met's 501K rows before any `/objects/{id}` call, cutting throttle exposure and wall time vs. the v1 API path. Combined with single-worker discipline and `--resume-skip-existing`, this is the production-safe ingest strategy per D-053/D-054.
+
+**Constraint conformance:** D-015, D-016, D-018, D-023, D-053, D-054.
