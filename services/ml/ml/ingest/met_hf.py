@@ -191,7 +191,16 @@ def convert_hf_row(row: dict[str, Any]) -> dict[str, Any]:
 
     Pure function — no I/O.
     """
-    out = dict(row)
+    # Strip PIL Image objects and other non-JSON-serializable column values that
+    # the HF metmuseum/openaccess dataset includes (e.g. an ``image`` column
+    # containing an actual decoded PIL.Image). We fetch images from the CDN URL
+    # stored in ``primaryImage`` — the embedded PIL object is never needed and
+    # cannot survive json.dumps() in raw_metadata.
+    # Duck-type check avoids importing PIL at module load time.
+    out = {
+        k: v for k, v in row.items()
+        if not (hasattr(v, "tobytes") and hasattr(v, "mode") and hasattr(v, "size"))
+    }
 
     # 1. objectID: string → int
     raw_id = out.get("objectID")
