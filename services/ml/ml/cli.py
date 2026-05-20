@@ -381,12 +381,14 @@ async def _ingest_met_hf_to_db(args: argparse.Namespace) -> int:
     from ml.ingest.met_hf import (
         DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT as MET_HF_DEFAULT_CIRCUIT_BREAKER,
         DEFAULT_IMAGE_DELAY_S as MET_HF_DEFAULT_IMAGE_DELAY,
+        DEFAULT_WORKERS as MET_HF_DEFAULT_WORKERS,
         ingest_met_hf_to_db,
     )
 
     limit = args.limit if args.limit is not None else 0
     offset = args.offset if args.offset is not None else 0
     batch_commit_size = args.batch_commit_size or MET_DEFAULT_BATCH_COMMIT_SIZE
+    workers = int(args.workers) if getattr(args, "workers", None) is not None else MET_HF_DEFAULT_WORKERS
     image_delay = (
         float(args.image_delay)
         if args.image_delay is not None
@@ -429,6 +431,7 @@ async def _ingest_met_hf_to_db(args: argparse.Namespace) -> int:
             limit=limit,
             offset=offset,
             batch_commit_size=batch_commit_size,
+            workers=workers,
             image_delay=image_delay,
             circuit_breaker_threshold=circuit_breaker_threshold,
             dry_run=args.dry_run,
@@ -1118,6 +1121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     from ml.ingest.met_hf import (
         DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT as MET_HF_DEFAULT_CDN_FAIL_LIMIT,
         DEFAULT_IMAGE_DELAY_S as MET_HF_DEFAULT_IMAGE_DELAY,
+        DEFAULT_WORKERS as MET_HF_DEFAULT_WORKERS,
     )
 
     met_hf = ingest_sub.add_parser(
@@ -1159,11 +1163,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Rows per DB transaction (default: 50).",
     )
     met_hf.add_argument(
+        "--workers", type=int, default=None,
+        help=(
+            f"Concurrent CDN image downloads per batch (also sets embedding "
+            f"batch size). Default: {MET_HF_DEFAULT_WORKERS}. Raise to 16-32 "
+            "for faster ingest; keep <40 to stay polite with the CDN."
+        ),
+    )
+    met_hf.add_argument(
         "--image-delay", type=float, default=None,
         dest="image_delay",
         help=(
-            f"Floor (seconds) between successive Met CDN image downloads. "
-            f"Default: {MET_HF_DEFAULT_IMAGE_DELAY} (~10 img/s). "
+            f"Floor (seconds) per worker inside the semaphore before each CDN "
+            f"request. Default: {MET_HF_DEFAULT_IMAGE_DELAY}. "
             "Raise if you see CDN errors or 429s."
         ),
     )
@@ -1177,8 +1189,8 @@ def _build_parser() -> argparse.ArgumentParser:
     met_hf.add_argument(
         "--circuit-breaker-threshold", type=int, default=None,
         help=(
-            "Abort after this many consecutive Met CDN image download "
-            f"failures (default: {MET_HF_DEFAULT_CDN_FAIL_LIMIT})."
+            "Abort after this many cumulative Met CDN image download "
+            f"failures across batches (default: {MET_HF_DEFAULT_CDN_FAIL_LIMIT})."
         ),
     )
     met_hf.add_argument(

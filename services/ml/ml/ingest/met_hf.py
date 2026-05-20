@@ -66,6 +66,7 @@ HF_DATASET_NAME = "metmuseum/openaccess"
 
 DEFAULT_IMAGE_DELAY_S = 0.1
 DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT = 50
+DEFAULT_WORKERS = 8
 
 PROGRESS_LOG_INTERVAL = 1000
 
@@ -254,6 +255,42 @@ async def _download_image(client: httpx.AsyncClient, url: str) -> bytes:
     return resp.content
 
 
+async def _download_batch(
+    client: httpx.AsyncClient,
+    records: list[dict[str, Any]],
+    *,
+    semaphore: asyncio.Semaphore,
+    image_delay: float,
+    stats: HFIngestStats,
+) -> list[tuple[dict[str, Any], bytes | None]]:
+    """Download images for a batch of mapped records concurrently.
+
+    Uses ``semaphore`` to cap simultaneous CDN connections. Returns a list of
+    ``(mapped_record, image_bytes)`` pairs; ``image_bytes`` is ``None`` when
+    the download failed (error already counted in ``stats``).
+    """
+    async def _one(rec: dict[str, Any]) -> tuple[dict[str, Any], bytes | None]:
+        async with semaphore:
+            if image_delay > 0:
+                await asyncio.sleep(image_delay)
+            try:
+                img = await _download_image(client, rec["image_url"])
+                stats.fetched_images += 1
+                return rec, img
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "met-hf CDN download failed for %s (%s): %s",
+                    rec.get("source_id"),
+                    rec.get("image_url"),
+                    exc,
+                )
+                stats.skipped_image_error += 1
+                return rec, None
+
+    results = await asyncio.gather(*[_one(r) for r in records])
+    return list(results)
+
+
 # ----------------------------------------------------------------- DB helpers
 
 
@@ -371,6 +408,7 @@ async def ingest_met_hf_to_db(
     limit: int = 0,
     offset: int = 0,
     batch_commit_size: int = DEFAULT_BATCH_COMMIT_SIZE,
+    workers: int = DEFAULT_WORKERS,
     embedder: Any | None = None,
     image_delay: float = DEFAULT_IMAGE_DELAY_S,
     request_delay: float | None = None,
@@ -381,7 +419,7 @@ async def ingest_met_hf_to_db(
     hf_dataset_name: str = HF_DATASET_NAME,
     max_records: int | None = None,
 ) -> HFIngestStats:
-    """v3 Met ingest: HF dataset → Met CDN image download → SigLIP embed → UPSERT.
+    """v3 Met ingest: HF dataset → concurrent Met CDN downloads → batch SigLIP embed → UPSERT.
 
     Parameters
     ----------
@@ -399,18 +437,25 @@ async def ingest_met_hf_to_db(
         meaningful when ``rows=None``; ignored for an explicit ``rows`` list.
     batch_commit_size:
         DB transaction granularity (rows per txn). Default 50.
+    workers:
+        Number of concurrent Met CDN image downloads per batch. Also controls
+        the batch size for embedding (all ``workers`` images are embedded in a
+        single forward pass). Default 8 (~13 req/s aggregate — well below the
+        ~80 req/s CDN ceiling). Raise to 16–32 for faster ingest; keep < 40
+        to stay polite.
     embedder:
-        Object exposing ``embed_bytes(bytes) -> np.ndarray``. Defaults to the
-        project default via ``get_embedder()``.
+        Object exposing ``embed_batch_bytes(list[bytes]) -> np.ndarray``.
+        Defaults to the project default via ``get_embedder()``.
     image_delay:
-        Floor (seconds) between successive Met CDN image downloads. Default
-        0.1 s (≈10 img/s). Polite and well within CDN limits.
+        Per-worker floor (seconds) inside the semaphore before each CDN
+        request. Default 0.1 s. With ``workers=8`` this caps the *theoretical*
+        max at 80 req/s but practical throughput is ~13 req/s due to network
+        latency.
     request_delay:
-        Alias for ``image_delay``; if set, takes precedence. Provided for
-        CLI flag consistency with other ingest adapters.
+        Alias for ``image_delay``; if set, takes precedence.
     circuit_breaker_threshold:
-        Abort with :exc:`MetCDNCircuitBreakerError` after this many consecutive
-        CDN image download failures. Default 50.
+        Abort with :exc:`MetCDNCircuitBreakerError` after this many cumulative
+        CDN image download failures in a row (across batches). Default 50.
     timeout:
         HTTP request timeout in seconds.
     dry_run:
@@ -432,12 +477,15 @@ async def ingest_met_hf_to_db(
         raise ValueError("circuit_breaker_threshold must be > 0")
     if not dry_run and pool is None:
         raise ValueError("pool is required when dry_run is False")
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
 
     effective_delay = request_delay if request_delay is not None else image_delay
     unlimited = limit is None or limit <= 0
 
     stats = HFIngestStats()
     embedder = embedder or get_embedder()
+    semaphore = asyncio.Semaphore(workers)
 
     skip_existing_ids: set[str] = set()
     if resume_skip_existing and pool is not None:
@@ -455,7 +503,88 @@ async def ingest_met_hf_to_db(
 
     ingested_so_far = 0
     consecutive_cdn_failures = 0
+
+    # Pending batch: filtered+mapped records waiting to be downloaded+embedded.
+    pending: list[dict[str, Any]] = []
+    # Ready batch: downloaded+embedded records waiting for DB commit.
     commit_batch: list[dict[str, Any]] = []
+
+    async def _flush_pending() -> None:
+        """Download images for all pending records concurrently, batch-embed,
+        and append successfully embedded records to ``commit_batch``.
+
+        Mutates ``pending``, ``commit_batch``, ``ingested_so_far``,
+        ``consecutive_cdn_failures`` via closure.
+        """
+        nonlocal ingested_so_far, consecutive_cdn_failures
+        if not pending:
+            return
+
+        pairs = await _download_batch(
+            client,
+            pending,
+            semaphore=semaphore,
+            image_delay=effective_delay,
+            stats=stats,
+        )
+
+        good_records = [r for r, img in pairs if img is not None]
+        good_images = [img for _, img in pairs if img is not None]
+        failed_count = len(pending) - len(good_records)
+
+        if failed_count > 0 and not good_records:
+            # Entire batch failed — accumulate toward circuit breaker.
+            consecutive_cdn_failures += failed_count
+            if consecutive_cdn_failures >= circuit_breaker_threshold:
+                raise MetCDNCircuitBreakerError(
+                    f"Circuit breaker tripped: {consecutive_cdn_failures} consecutive "
+                    "Met CDN image download failures. The CDN may be blocking the "
+                    "egress IP or be temporarily unreachable. Wait a few minutes and retry."
+                )
+        else:
+            # At least one success in the batch — reset the consecutive counter.
+            consecutive_cdn_failures = 0
+
+        if not good_images:
+            pending.clear()
+            return
+
+        # Batch embed all successful images in a single forward pass.
+        try:
+            vecs: np.ndarray = await asyncio.to_thread(
+                embedder.embed_batch_bytes, good_images
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("met-hf batch embed failed (%d images): %s", len(good_images), exc)
+            stats.skipped_embed_error += len(good_images)
+            pending.clear()
+            return
+        finally:
+            good_images.clear()  # release image memory
+
+        for rec, vec in zip(good_records, vecs):
+            norm = float(np.linalg.norm(np.asarray(vec)))
+            rec["embedding"] = vec
+            ingested_so_far += 1
+            stats.last_object_ids.append(int(rec["source_id"]))
+            logger.info(
+                "embed met:%s title=%r vec_norm=%.4f",
+                rec["source_id"],
+                (rec.get("title") or "")[:80],
+                norm,
+            )
+            if not dry_run:
+                commit_batch.append(rec)
+            else:
+                stats.inserted += 1
+
+        pending.clear()
+
+    async def _maybe_commit() -> None:
+        nonlocal commit_batch
+        if len(commit_batch) >= batch_commit_size:
+            await _commit_batch(pool, commit_batch, stats=stats)
+            commit_batch.clear()
 
     async with httpx.AsyncClient(
         timeout=timeout,
@@ -474,12 +603,13 @@ async def ingest_met_hf_to_db(
             if stats.hf_rows_total % PROGRESS_LOG_INTERVAL == 0:
                 logger.info(
                     "met-hf progress: scanned=%d accepted=%d skipped_filter=%d "
-                    "ingested=%d cdn_errors=%d",
+                    "ingested=%d cdn_errors=%d workers=%d",
                     stats.hf_rows_total,
                     stats.hf_rows_accepted,
                     stats.hf_rows_skipped_filter,
                     ingested_so_far,
                     stats.skipped_image_error,
+                    workers,
                 )
 
             # ---- isPublicDomain pre-filter ----
@@ -507,72 +637,24 @@ async def ingest_met_hf_to_db(
             if not unlimited and ingested_so_far >= limit:
                 break
 
-            # ---- CDN image download ----
-            img_url = mapped["image_url"]
+            # ---- check image URL ----
+            img_url = mapped.get("image_url")
             if not img_url:
                 stats.hf_rows_skipped_no_image += 1
                 continue
 
-            if effective_delay > 0:
-                await asyncio.sleep(effective_delay)
+            # ---- accumulate into pending batch ----
+            pending.append(mapped)
 
-            try:
-                img_bytes = await _download_image(client, img_url)
-                stats.fetched_images += 1
-                consecutive_cdn_failures = 0
-            except httpx.HTTPError as exc:
-                consecutive_cdn_failures += 1
-                logger.warning(
-                    "met-hf CDN image download failed for %s (%s): %s "
-                    "[consecutive_failures=%d]",
-                    source_id,
-                    img_url,
-                    exc,
-                    consecutive_cdn_failures,
-                )
-                stats.skipped_image_error += 1
-                if consecutive_cdn_failures >= circuit_breaker_threshold:
-                    raise MetCDNCircuitBreakerError(
-                        f"Circuit breaker tripped: {consecutive_cdn_failures} consecutive "
-                        f"Met CDN image download failures (last source_id={source_id}). "
-                        "The CDN may be blocking the egress IP or be temporarily "
-                        "unreachable. Wait a few minutes and retry."
-                    ) from exc
-                continue
+            if len(pending) >= workers:
+                await _flush_pending()
+                await _maybe_commit()
 
-            # ---- embed ----
-            try:
-                vec = await asyncio.to_thread(embedder.embed_bytes, img_bytes)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "met-hf embed failed for %s: %s", source_id, exc
-                )
-                stats.skipped_embed_error += 1
-                continue
-            finally:
-                img_bytes = None  # type: ignore[assignment]  # release memory
+        # Flush any remaining partial batch.
+        if pending:
+            await _flush_pending()
 
-            norm = float(np.linalg.norm(np.asarray(vec)))
-            mapped["embedding"] = vec
-            stats.last_object_ids.append(int(source_id))
-            logger.info(
-                "embed met:%s title=%r vec_norm=%.4f",
-                source_id,
-                (mapped.get("title") or "")[:80],
-                norm,
-            )
-            ingested_so_far += 1
-
-            if dry_run:
-                stats.inserted += 1
-                continue
-
-            commit_batch.append(mapped)
-            if len(commit_batch) >= batch_commit_size:
-                await _commit_batch(pool, commit_batch, stats=stats)
-                commit_batch.clear()
-
-        # Flush trailing batch.
+        # Final DB commit for trailing records.
         if commit_batch and not dry_run:
             await _commit_batch(pool, commit_batch, stats=stats)
             commit_batch.clear()
@@ -580,7 +662,7 @@ async def ingest_met_hf_to_db(
     logger.info(
         "met-hf done: hf_rows_total=%d accepted=%d skipped_filter=%d "
         "fetched_images=%d ingested=%d inserted=%d updated=%d "
-        "skipped_image=%d skipped_embed=%d skipped_db=%d",
+        "skipped_image=%d skipped_embed=%d skipped_db=%d workers=%d",
         stats.hf_rows_total,
         stats.hf_rows_accepted,
         stats.hf_rows_skipped_filter,
@@ -591,6 +673,7 @@ async def ingest_met_hf_to_db(
         stats.skipped_image_error,
         stats.skipped_embed_error,
         stats.skipped_db_error,
+        workers,
     )
     return stats
 
@@ -600,6 +683,7 @@ async def ingest_met_hf_to_db(
 __all__ = [
     "DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT",
     "DEFAULT_IMAGE_DELAY_S",
+    "DEFAULT_WORKERS",
     "HF_DATASET_NAME",
     "HFIngestStats",
     "MetCDNCircuitBreakerError",
