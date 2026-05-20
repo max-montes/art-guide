@@ -492,7 +492,7 @@ async def ingest_met_hf_to_db(
             api_dict = convert_hf_row(hf_row)
 
             # ---- map_met_record filter ----
-            mapped = map_met_record(api_dict)
+            mapped = map_met_record(api_dict, require_classification_match=False)
             if mapped is None:
                 stats.skipped_filter += 1
                 continue

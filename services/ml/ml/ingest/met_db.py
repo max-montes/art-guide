@@ -166,11 +166,19 @@ class IngestStats:
 
 # ----------------------------------------------------------------- mapping
 
-def map_met_record(raw: dict[str, Any]) -> dict[str, Any] | None:
+def map_met_record(
+    raw: dict[str, Any],
+    *,
+    require_classification_match: bool = True,
+) -> dict[str, Any] | None:
     """Map a raw Met ``/objects/{id}`` payload to an ``artworks``-row dict.
 
     Returns ``None`` if the record fails any filter (not public domain,
-    no primary image, classification doesn't match paintings/sculpture).
+    no primary image). When ``require_classification_match=True`` (default),
+    also rejects records whose classification doesn't match the
+    paintings/sculpture vocabulary — this gate is appropriate for the live
+    API adapter (which has no pre-filtering) but should be disabled for the
+    HF bulk adapter (where all public-domain records are wanted).
 
     Pure function — no I/O. Unit tests can call it directly.
 
@@ -193,9 +201,10 @@ def map_met_record(raw: dict[str, Any]) -> dict[str, Any] | None:
     if not primary_image:
         return None
 
-    classification = raw.get("classification") or raw.get("objectName")
-    if not _classification_matches(classification):
-        return None
+    if require_classification_match:
+        classification = raw.get("classification") or raw.get("objectName")
+        if not _classification_matches(classification):
+            return None
 
     source_id = str(object_id)
     artwork_id = f"{MET_SOURCE_SLUG}:{source_id}"
@@ -277,6 +286,21 @@ async def _get_with_retry(
     max_retries: int = DEFAULT_MAX_RETRIES,
     stats: IngestStats | None = None,
 ) -> Any:
+    """GET with exponential backoff for transient errors only.
+
+    Retries on:
+      * 429 (rate-limited) — bookkept in stats.rate_limited_events
+      * 5xx (server errors) — likely transient
+      * network errors (httpx.RequestError) — connection / timeout
+
+    Skips immediately (raises on first attempt) on:
+      * 4xx other than 429 (e.g. 403/404) — these are per-record permanent
+        states; retrying just burns the polite request budget. The Met API
+        regularly 403s on records that were ingested into the public-domain
+        catalog but later restricted, or 404s on retired ids. With 8 parallel
+        replicas a 30s retry storm per such record completely dominates
+        throughput.
+    """
     attempt = 0
     while True:
         attempt += 1
@@ -288,8 +312,28 @@ async def _get_with_retry(
                 raise httpx.HTTPStatusError(
                     "rate limited", request=resp.request, response=resp
                 )
+            # Permanent 4xx (not 429): bail out without retry.
+            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                resp.raise_for_status()
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            # Don't retry permanent 4xx (everything except 429).
+            if status is not None and 400 <= status < 500 and status != 429:
+                raise
+            if attempt > max_retries:
+                raise
+            sleep_s = min(30.0, 2 ** (attempt - 1)) + random.uniform(0, 0.5)
+            logger.warning(
+                "Met %s failed (attempt %d/%d): %s. Sleeping %.2fs",
+                url,
+                attempt,
+                max_retries,
+                exc,
+                sleep_s,
+            )
+            await asyncio.sleep(sleep_s)
         except (httpx.HTTPError, ValueError) as exc:
             if attempt > max_retries:
                 raise
@@ -419,7 +463,7 @@ async def _commit_batch(
 async def ingest_met_to_db(
     *,
     pool: asyncpg.Pool | None,
-    limit: int = DEFAULT_LIMIT,
+    limit: int | None = DEFAULT_LIMIT,
     batch_commit_size: int = DEFAULT_BATCH_COMMIT_SIZE,
     department_ids: list[int] | None = None,
     embedder: Any | None = None,
@@ -427,6 +471,8 @@ async def ingest_met_to_db(
     timeout: float = DEFAULT_HTTP_TIMEOUT_S,
     user_agent: str = DEFAULT_USER_AGENT,
     base_url: str = DEFAULT_BASE_URL,
+    shard_index: int = 0,
+    shard_count: int = 1,
     dry_run: bool = False,
 ) -> IngestStats:
     """Fetch Met records, embed, and UPSERT into the ``artworks`` table.
@@ -439,7 +485,8 @@ async def ingest_met_to_db(
     limit:
         Maximum number of records to *successfully ingest* (i.e. embedded
         and ready to write). The discovery list is much larger; we stop
-        iterating early once ``limit`` is hit.
+        iterating early once ``limit`` is hit. ``None`` or ``0`` means
+        "no limit — process every candidate id in the (sharded) list".
     batch_commit_size:
         Number of rows accumulated before each DB transaction.
     department_ids:
@@ -450,6 +497,12 @@ async def ingest_met_to_db(
         Defaults to the project default (SigLIP-base via D-015).
     request_delay:
         Floor (seconds) between successive Met API requests. Polite throttling.
+    shard_index, shard_count:
+        Work-sharding for parallel ingest. When ``shard_count > 1`` the
+        candidate id list is partitioned by ``i % shard_count == shard_index``
+        so N replicas can run concurrently with no shared coordination.
+        Idempotent upsert means duplicate processing is safe but wasteful,
+        so the modulo split keeps each replica on a disjoint set of ids.
     dry_run:
         If True, skip DB writes; still fetches + downloads + embeds so we
         can validate the pipeline without a database.
@@ -460,8 +513,15 @@ async def ingest_met_to_db(
     """
     if not dry_run and pool is None:
         raise ValueError("pool is required when dry_run is False")
-    if limit <= 0:
-        raise ValueError("limit must be positive")
+    if shard_count < 1:
+        raise ValueError("shard_count must be >= 1")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(
+            f"shard_index ({shard_index}) must be in [0, shard_count={shard_count})"
+        )
+
+    # limit semantics: None or non-positive means "unbounded".
+    unlimited = limit is None or limit <= 0
 
     embedder = embedder or get_embedder()
     stats = IngestStats()
@@ -476,17 +536,31 @@ async def ingest_met_to_db(
             client, base_url, department_ids, stats=stats
         )
         stats.candidate_ids = len(ids)
+
+        # Apply modulo sharding. Each replica processes only its slice.
+        if shard_count > 1:
+            ids = [oid for i, oid in enumerate(ids) if i % shard_count == shard_index]
+            logger.info(
+                "shard %d/%d: %d ids assigned (of %d global candidates)",
+                shard_index,
+                shard_count,
+                len(ids),
+                stats.candidate_ids,
+            )
+
         logger.info(
-            "Met /objects returned %d candidate ids; ingesting up to %d",
+            "Met /objects returned %d global candidate ids; "
+            "this shard has %d to process; limit=%s",
             stats.candidate_ids,
-            limit,
+            len(ids),
+            "unlimited" if unlimited else str(limit),
         )
 
         batch: list[dict[str, Any]] = []
         embedded_so_far = 0
 
         for object_id in ids:
-            if embedded_so_far >= limit:
+            if not unlimited and embedded_so_far >= limit:
                 break
             if request_delay > 0:
                 await asyncio.sleep(request_delay)
