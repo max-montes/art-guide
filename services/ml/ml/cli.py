@@ -280,6 +280,7 @@ async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
 
     from ml.ingest.met_csv import (
         DEFAULT_CACHE_MAX_AGE_DAYS as MET_CSV_CACHE_MAX_AGE_DAYS,
+        DEFAULT_CONSECUTIVE_403_LIMIT as MET_CSV_DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
         DEFAULT_EMBED_BATCH_SIZE as MET_CSV_DEFAULT_EMBED_BATCH,
         ingest_met_csv_to_db,
     )
@@ -299,6 +300,11 @@ async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
         float(args.request_delay)
         if args.request_delay is not None
         else DEFAULT_REQUEST_DELAY_S
+    )
+    circuit_breaker_threshold = (
+        int(args.circuit_breaker_threshold)
+        if args.circuit_breaker_threshold is not None
+        else MET_CSV_DEFAULT_CIRCUIT_BREAKER_THRESHOLD
     )
 
     pool = None
@@ -330,6 +336,7 @@ async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
             batch_commit_size=batch_commit_size,
             embed_batch_size=embed_batch_size,
             request_delay=request_delay,
+            circuit_breaker_threshold=circuit_breaker_threshold,
             cache_max_age_days=cache_max_age_days,
             force_refresh_csv=args.force_refresh,
             dry_run=args.dry_run,
@@ -356,6 +363,97 @@ async def _ingest_met_dump_to_db(args: argparse.Namespace) -> int:
         f"skipped_embed={summary['skipped_embed_error']}, "
         f"skipped_db={summary['skipped_db_error']}, "
         f"rate_limited={summary['rate_limited_events']}"
+    )
+    return 0
+
+
+def _cmd_ingest_met_hf(args: argparse.Namespace) -> int:
+    """v3 Met ingest via the HF metmuseum/openaccess dataset (API-bypass path)."""
+    return asyncio.run(_ingest_met_hf_to_db(args))
+
+
+async def _ingest_met_hf_to_db(args: argparse.Namespace) -> int:
+    import asyncpg
+
+    from ml.ingest.met_db import (
+        DEFAULT_BATCH_COMMIT_SIZE as MET_DEFAULT_BATCH_COMMIT_SIZE,
+    )
+    from ml.ingest.met_hf import (
+        DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT as MET_HF_DEFAULT_CIRCUIT_BREAKER,
+        DEFAULT_IMAGE_DELAY_S as MET_HF_DEFAULT_IMAGE_DELAY,
+        ingest_met_hf_to_db,
+    )
+
+    limit = args.limit if args.limit is not None else 0
+    offset = args.offset if args.offset is not None else 0
+    batch_commit_size = args.batch_commit_size or MET_DEFAULT_BATCH_COMMIT_SIZE
+    image_delay = (
+        float(args.image_delay)
+        if args.image_delay is not None
+        else (
+            float(args.request_delay)
+            if args.request_delay is not None
+            else MET_HF_DEFAULT_IMAGE_DELAY
+        )
+    )
+    circuit_breaker_threshold = (
+        int(args.circuit_breaker_threshold)
+        if args.circuit_breaker_threshold is not None
+        else MET_HF_DEFAULT_CIRCUIT_BREAKER
+    )
+
+    pool = None
+    if not args.dry_run:
+        dsn = args.database_url or os.environ.get("DATABASE_URL") or DEFAULT_LOCAL_DSN
+        logger.info("Opening asyncpg pool against %s", _scrub_dsn(dsn))
+        try:
+            pool = await asyncpg.create_pool(
+                dsn=dsn,
+                min_size=1,
+                max_size=4,
+                command_timeout=30,
+                timeout=15,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"Could not open Postgres pool ({exc!s}). "
+                "Pass --dry-run to skip DB writes, or bring up "
+                "infra/docker-compose.yml first.",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        stats = await ingest_met_hf_to_db(
+            pool=pool,
+            limit=limit,
+            offset=offset,
+            batch_commit_size=batch_commit_size,
+            image_delay=image_delay,
+            circuit_breaker_threshold=circuit_breaker_threshold,
+            dry_run=args.dry_run,
+            resume_skip_existing=bool(getattr(args, "resume_skip_existing", False)),
+            max_records=getattr(args, "max_records", None),
+        )
+    finally:
+        if pool is not None:
+            await pool.close()
+
+    summary = stats.as_dict()
+    mode = "DRY-RUN" if args.dry_run else "DB"
+    print(
+        f"[{mode}] Met-HF ingest done: "
+        f"hf_rows={summary['hf_rows_total']}, "
+        f"accepted={summary['hf_rows_accepted']}, "
+        f"skipped_filter_pd={summary['hf_rows_skipped_filter']}, "
+        f"skipped_filter_map={summary['skipped_filter']}, "
+        f"fetched_images={summary['fetched_images']}, "
+        f"persisted={summary['total_persisted']} "
+        f"(inserted={summary['inserted']}, updated={summary['updated']}), "
+        f"skipped_existing={summary['skipped_existing']}, "
+        f"skipped_image={summary['skipped_image_error']}, "
+        f"skipped_embed={summary['skipped_embed_error']}, "
+        f"skipped_db={summary['skipped_db_error']}"
     )
     return 0
 
@@ -712,7 +810,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ingest
     ingest = sub.add_parser("ingest", help="Run an ingestion adapter.")
-    ingest_sub = ingest.add_subparsers(dest="source", metavar="{met,met-dump,rijks,aic,aic-dump}")
+    ingest_sub = ingest.add_subparsers(dest="source", metavar="{met,met-dump,met-hf,rijks,aic,aic-dump}")
 
     met = ingest_sub.add_parser(
         "met", help="Ingest from The Met Open Access collection."
@@ -937,6 +1035,10 @@ def _build_parser() -> argparse.ArgumentParser:
     rijks.set_defaults(func=_cmd_ingest_rijks)
 
     # ingest met-dump (v2 CSV-based)
+    from ml.ingest.met_csv import (
+        DEFAULT_CONSECUTIVE_403_LIMIT as MET_CSV_DEFAULT_CONSECUTIVE_403_LIMIT,
+    )
+
     met_dump = ingest_sub.add_parser(
         "met-dump",
         help=(
@@ -985,6 +1087,13 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     met_dump.add_argument(
+        "--circuit-breaker-threshold", type=int, default=None,
+        help=(
+            "Abort after this many consecutive 403s from the Met API "
+            f"(default: {MET_CSV_DEFAULT_CONSECUTIVE_403_LIMIT})."
+        ),
+    )
+    met_dump.add_argument(
         "--cache-max-age-days", type=int, default=None,
         help="Re-download the CSV if cache is older than this many days (default: 7).",
     )
@@ -1004,6 +1113,84 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     met_dump.set_defaults(func=_cmd_ingest_met_dump)
+
+    # ingest met-hf (v3 HF dataset — bypasses Met API entirely)
+    from ml.ingest.met_hf import (
+        DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT as MET_HF_DEFAULT_CDN_FAIL_LIMIT,
+        DEFAULT_IMAGE_DELAY_S as MET_HF_DEFAULT_IMAGE_DELAY,
+    )
+
+    met_hf = ingest_sub.add_parser(
+        "met-hf",
+        help=(
+            "v3 Met ingest: stream the metmuseum/openaccess HF dataset. "
+            "No Met API calls — primaryImage URLs come directly from the "
+            "HF dataset. Bypasses the Azure egress IP ban entirely."
+        ),
+    )
+    met_hf.add_argument(
+        "--limit", type=int, default=None,
+        help="Max records to successfully ingest. 0 / omitted = unlimited.",
+    )
+    met_hf.add_argument(
+        "--offset", type=int, default=None,
+        help=(
+            "Skip the first N rows of the HF dataset stream before any "
+            "filtering. Use to resume a partial run from a known position."
+        ),
+    )
+    met_hf.add_argument(
+        "--max-records", type=int, default=None,
+        help=(
+            "Stop reading the HF stream after this many rows (before filtering). "
+            "Use 20 for a smoke run."
+        ),
+    )
+    met_hf.add_argument(
+        "--dry-run", action="store_true",
+        help="Image download + embed end-to-end; skip DB writes.",
+    )
+    met_hf.add_argument(
+        "--database-url", default=None,
+        help="Postgres DSN (default: $DATABASE_URL or local docker-compose).",
+    )
+    met_hf.add_argument(
+        "--batch-commit-size", type=int, default=None,
+        help="Rows per DB transaction (default: 50).",
+    )
+    met_hf.add_argument(
+        "--image-delay", type=float, default=None,
+        dest="image_delay",
+        help=(
+            f"Floor (seconds) between successive Met CDN image downloads. "
+            f"Default: {MET_HF_DEFAULT_IMAGE_DELAY} (~10 img/s). "
+            "Raise if you see CDN errors or 429s."
+        ),
+    )
+    met_hf.add_argument(
+        "--request-delay", type=float, default=None,
+        help=(
+            f"Alias for --image-delay (CDN politeness delay). "
+            f"Default: {MET_HF_DEFAULT_IMAGE_DELAY}."
+        ),
+    )
+    met_hf.add_argument(
+        "--circuit-breaker-threshold", type=int, default=None,
+        help=(
+            "Abort after this many consecutive Met CDN image download "
+            f"failures (default: {MET_HF_DEFAULT_CDN_FAIL_LIMIT})."
+        ),
+    )
+    met_hf.add_argument(
+        "--resume-skip-existing",
+        action="store_true",
+        help=(
+            "On startup, query the DB for source_id values already present "
+            "for source='met' and skip those rows (before any image download). "
+            "Use when restarting an interrupted run."
+        ),
+    )
+    met_hf.set_defaults(func=_cmd_ingest_met_hf)
 
     # ingest aic-dump (v2 git-cloned JSON tree)
     aic_dump = ingest_sub.add_parser(

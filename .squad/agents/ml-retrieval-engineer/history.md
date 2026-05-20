@@ -242,3 +242,158 @@ or the dump-adapter tests.
 
 ### 2026-05-17T07:30: backend-engineer ported D-060 resume-skip pattern to met_csv.py
 - D-062 filed: Met v2 adapter now has `--resume-skip-existing` parity with AIC/Rijks v1 adapters. Enables safe ACA Job restarts without re-embedding.
+
+## 2026-05-19 — Met CSV bulk ingest research (Brady request)
+
+**Context:** Brady asked for research + plan on the Met Open Access GitHub CSV as a way to sidestep the persistent IP ban (4 backoff attempts, still banned at 100 Met records). Researched the CSV and current codebase to assess feasibility.
+
+**Finding:** The Met CSV ingest was already fully shipped as part of D-059 (2026-05-16). The `art-guide-ml ingest met-dump` command and `services/ml/ml/ingest/met_csv.py` (807 LOC) implement exactly the approach Brady described. The ACA Job is configured to use this path (D-062). Circuit breaker added in D-065.
+
+**Research output:** `.squad/decisions/inbox/ml-retrieval-engineer-met-csv-research.md` — full technical summary covering CSV column structure, column→NormalizedArtwork mapping, pipeline flow diagram, yield estimate (~200K records after PD + image filters), and production gotchas.
+
+## Learnings
+
+- **The CSV does NOT carry `primaryImage`.** This is the #1 gotcha. The Met Open Access CSV has 51 columns including `Artist Display Name`, `Title`, `Medium`, `Period`, `Dynasty`, `Object Date`, `Dimensions`, `Credit Line`, `Object Wikidata URL`, and `Tags` — but NOT image URLs. `primaryImage` and `primaryImageSmall` only exist in the `/objects/{id}` API response. The dump saves time via pre-filtering (~50% rejection), not via eliminating API calls.
+
+- **The Met CSV is served via Git LFS media proxy** at `media.githubusercontent.com/media/metmuseum/openaccess/refs/heads/master/MetObjects.csv`. No `git-lfs` install needed. `httpx.stream()` with `follow_redirects=True` downloads the raw bytes directly. The file has a UTF-8 BOM on the first column header (`\ufeffObject Number`) — strip it before dict-keying rows.
+
+- **~501K rows, ~300 MB, CC0 license.** After PD pre-filter + classification denylist: ~250K eligible for API fetch. After `map_met_record` (primaryImage non-empty + classification matches): ~200–230K final records. The pre-filter alone cuts API cost in half vs. the v1 path which has no such gate.
+
+- **Research tasks that ask "can we do X?" should first check history.md + decisions.md.** The answer was already in the file (D-059, first paragraph). A quick grep would have surfaced it before spinning up web research. Lesson: for any ingest/pipeline research, check `decisions.md` for D-059 onward before doing external research.
+
+## 2026-05-20 — Met API IP ban contingency plan [ml-retrieval-engineer-d067]
+
+**Context:** Brady asked for a prioritized contingency plan after 4 Azure backoff attempts + 1 region swap (East US) all failed with 403. The Met appears to have flagged entire Azure IP ranges, not region-specific or per-IP bans. Current state: stuck at 100 Met records; need ~200K.
+
+**Work completed:**
+
+1. **Contingency plan document:** `.squad/log/met-ingest-contingency-plan.md` (14K, fully detailed)
+   - 5 ranked options: Contact Met (E), GitHub Actions runner (B), more Azure regions (A), pre-scraped ID→URL (C), alternative museums (D)
+   - Phase 1 (2 days): parallel fallback — email Met, start GitHub Actions implementation, research pre-scraped datasets
+   - Phase 2 (triggered): escalate to region swaps, commit to Smithsonian adapter if Met doesn't respond by Thursday EOD
+
+2. **Decision file:** `.squad/decisions/inbox/ml-retrieval-engineer-met-contingency.md` (D-067)
+   - Ranked recommendation: Contact Met → GitHub Actions runner → more regions → pre-scraped datasets → alternative museums
+   - Implementation dependencies and constraint conformance (hard rules #3, #4, D-016, D-054)
+
+**Option analysis:**
+
+- **Option E (Contact Met):** No downside; may solve immediately. Should be first step.
+- **Option B (GitHub Actions runner):** Proven, low-risk, repeatable. Unblocks ingest regardless of Azure status; can run weekly thereafter.
+- **Option A (More Azure regions):** Low effort (15 min per region), low confidence (entire Azure likely blocked). Worth one try (North Europe) before escalating, but not primary.
+- **Option C (Pre-scraped):** Research-dependent; quick to validate. May provide shortcut if Met dataset exists.
+- **Option D (Alternative museums):** Medium-long term (1–2 weeks per adapter). Smithsonian + Harvard + V&A → 3M+ records, making Met optional.
+
+**Rationale for ranking:**
+1. Contact Met first — best case solves immediately; worst case, no loss.
+2. GitHub Actions — highest confidence fallback; low risk; repeatable. Can run weekly for incremental syncs.
+3. More Azure regions — low cost, low chance. Eliminates "maybe another region works" uncertainty.
+4. Pre-scraped — research-dependent; may find shortcut, but uncertain ROI.
+5. Alternative museums — safest long-term (diversifies catalog, makes Met optional); but requires engineering effort.
+
+## Learnings
+
+- **Treat Azure egress as "blocked by Met" once 2 regions fail.** West US 3 → East US both failed within 5 min with circuit breaker. Unless Met's ban mechanism is per-IP with a time-decay (which would be unusual), the entire Azure ASN is likely flagged. Subsequent region swaps are low ROI; escalate to non-Azure paths instead.
+
+- **The circuit breaker + exponential backoff strategy is sound in isolation, but the root cause (broad Azure IP block) is outside the scope of retry logic.** The circuit breaker correctly prevented wasted hours on doomed job runs; the exponential backoff correctly waited for unban windows. But if the ban is persistent (>24h, flagged to Azure ASN), neither helps. The lesson: when retry exhaustion persists, escalate to structural changes (egress path, data source) rather than tuning parameters.
+
+- **GitHub Actions as an "off-Azure" egress path is attractive and practical.** It's diverse IP, known infrastructure, free tier, and runs standard Python code. For longer ingest jobs (>6h), batch into multiple workflows. For one-time 200K record ingest (~2–3h), a single scheduled run is safe and proven.
+
+- **Contacting the Met directly should always be attempted first.** They have an API team, they maintain open-access policy, and they likely understand the challenge of rate-limiting. The risk of asking is near-zero; the upside (IP whitelist or API key) is high. Email is low-friction; museum support may be slow (1–7 days), but worth the wait before escalating.
+
+- **"Replace the source" (Option D) is a valid contingency when a single source is unreliable.** Smithsonian alone is 3M+ objects. Combined with AIC + Rijks + Harvard + V&A, we reach multi-million catalog sizes. The Met becomes "another source," not the critical path. Long-term catalog health depends on source diversification, not single-source perfection.
+
+## 2026-05-19T18:51 — Met API outreach email draft
+
+**Task:** Brady requested a professional email to the Met Museum API team to request IP whitelist or temporary API key to unblock the 403-forbidden Azure ingest (4 attempts exhausted).
+
+**Completed:**
+- Email draft saved to `.squad/log/met-api-email-draft.md`
+- Includes subject line, concise body (~160 words), contact info (openaccess@metmuseum.org), placeholders for Brady's name/email/repo, and a note about using personal email to avoid spam filters
+- Tone: developer-to-developer, respectful, specific ask (either IP whitelist or API key)
+- Framed as one-time bulk ingest of CC0 records, educational/non-commercial intent, ~200K records
+
+## 2026-05-19T19:09 — Option C feasibility: Hugging Face `metmuseum/openaccess`
+
+**Task:** Investigate whether the Hugging Face dataset `metmuseum/openaccess` can replace our blocked API-based Met ingest by providing image URLs directly.
+
+**Sources checked:**
+- HF README: `https://huggingface.co/datasets/metmuseum/openaccess/raw/main/README.md`
+- HF dataset server first rows: `https://datasets-server.huggingface.co/first-rows?dataset=metmuseum/openaccess&config=default&split=train`
+- Official Met README: `https://raw.githubusercontent.com/metmuseum/openaccess/master/README.md`
+- Official Met GitHub CSV header via `media.githubusercontent.com`
+- Local code: `services/ml/ml/ingest/met_db.py`, `services/ml/ml/ingest/met_csv.py`
+
+**HF dataset schema (58 columns):**
+`objectID`, `isHighlight`, `accessionNumber`, `accessionYear`, `isPublicDomain`, `primaryImage`, `primaryImageSmall`, `additionalImages`, `constituents`, `department`, `objectName`, `title`, `culture`, `period`, `dynasty`, `reign`, `portfolio`, `artistRole`, `artistPrefix`, `artistDisplayName`, `artistDisplayBio`, `artistSuffix`, `artistAlphaSort`, `artistNationality`, `artistBeginDate`, `artistEndDate`, `artistGender`, `artistWikidata_URL`, `artistULAN_URL`, `objectDate`, `objectBeginDate`, `objectEndDate`, `medium`, `dimensions`, `measurements`, `creditLine`, `geographyType`, `city`, `state`, `county`, `country`, `region`, `subregion`, `locale`, `locus`, `excavation`, `river`, `classification`, `rightsAndReproduction`, `linkResource`, `metadataDate`, `repository`, `objectURL`, `tags`, `objectWikidata_URL`, `isTimelineWork`, `GalleryNumber`, `image`.
+
+**Official Met GitHub CSV schema (54 columns):** same core metadata, but **no** `primaryImage`, `primaryImageSmall`, `additionalImages`, `measurements`, `objectURL`, or HF `image`; instead it has spaced headers such as `Object Number`, `Object ID`, `Artist Display Name`, `Link Resource`, plus `Tags AAT URL` and `Tags Wikidata URL`.
+
+**What `map_met_record()` reads from `raw`:**
+`objectID`, `isPublicDomain`, `primaryImage`, `classification`, `objectName`, `primaryImageSmall`, `department`, `culture`, `period`, `tags`, `title`, `artistDisplayName`, `objectDate`, `medium`, `objectURL`, `artistDisplayBio`, `creditLine`, `dimensions`, `dynasty`, `objectWikidata_URL`, `objectBeginDate`, `objectEndDate`.
+
+**Coverage vs HF dataset:**
+- **Directly covered:** all 22 fields above have direct HF equivalents with the same names.
+- **Named/shape differences to handle:** `tags` arrives as a JSON string in HF, but `map_met_record()` expects `list[dict]` and loops `tags[].term`; parse with `json.loads()` first. `linkResource` exists in HF but is not used by `map_met_record()`; sample rows show it as null/typed `float64`, while `objectURL` is populated and is the better source. `constituents` is also a JSON string but currently unused.
+
+**Image URL finding:**
+- **Yes, HF includes Met CDN image URLs.** Sample rows expose:
+  - `primaryImage = https://images.metmuseum.org/CRDImages/.../original/...jpg`
+  - `primaryImageSmall = https://images.metmuseum.org/CRDImages/.../web-large/...jpg`
+  - `additionalImages = https://images.metmuseum.org/CRDImages/...|...`
+- This means the HF derivative dataset can supply direct CDN download URLs without calling `/objects/{id}`.
+- The extra HF `image` column is a Hugging Face-hosted asset/proxy and is not needed for our ingest; `primaryImage` is the correct source for full-size Met CDN downloads.
+
+**Official Met GitHub CSV finding:**
+- README explicitly says **"Images not included"**.
+- Live CSV header confirms there are **no image URL columns** in the official GitHub dump.
+- So the earlier `met_csv.py` design and D-059/D-062 remain correct **for the official Met dump**.
+
+**Feasibility verdict:**
+- **HF dataset: YES — can bypass the Met API entirely.** It already contains every field `map_met_record()` needs, including `primaryImage` / `primaryImageSmall`.
+- **Official Met GitHub CSV: NO — cannot bypass API.** It lacks image URLs, so it still requires `/objects/{id}` enrichment.
+
+**Estimated adaptation effort:**
+- **Low-to-moderate (~0.5–1 day)** to add a new HF-backed ingest path.
+- Simplest path: add `met_hf.py` (or a new branch in `met_csv.py`) that streams the HF parquet/dataset rows, normalizes JSON-string fields (`tags`, optionally `constituents`), feeds an API-shaped dict into `map_met_record()`, then reuses the existing image-download, embed-batch, and DB upsert flow.
+- Likely dependency/work needed: parquet/HF reader (`pyarrow` or `datasets`/`huggingface_hub`) plus tests. No API retry/circuit-breaker logic needed for object metadata anymore; only image-download retries remain.
+
+**Net conclusion:** Option C is viable **only if we treat Hugging Face as a derivative Met source**. It is not the same as the official Met GitHub CSV. The HF derivative dataset appears to unblock a true zero-Met-API ingest path.
+
+## 2026-05-19 — Tests for met_hf.py adapter (TDD-first)
+
+**Context:** A new `met_hf.py` adapter is being built that ingests the
+`metmuseum/openaccess` HF dataset instead of calling the banned Met API.
+Tests were written ahead of the implementation to spec out the expected
+interface.
+
+**File added:**
+- `services/ml/tests/test_met_hf.py` — 40 tests across 9 groups:
+  1. `convert_hf_row` field mapping (8 cases)
+  2. `_row_passes_hf_filter` isPublicDomain (6 cases)
+  3. Tags parsing: JSON string / null / empty / malformed / round-trip (7 cases)
+  4. `convert_hf_row` + `map_met_record` integration (3 cases)
+  5. Missing `primaryImageSmall` (3 cases + async mock)
+  6. isPublicDomain filter at ingest level (2 async cases)
+  7. Circuit breaker: trip, reset-on-success, threshold=0 guard (4 cases)
+  8. CLI registration: `ingest met-hf`, `--circuit-breaker-threshold` (2 cases)
+  9. `HFIngestStats` counters + `total_persisted` (3 cases)
+
+All 40 tests collected and skip cleanly with a clear message while the
+module is absent. Existing 199 tests continue to pass.
+
+**Interface assumptions documented in test file header:**
+- `convert_hf_row(row) -> dict` — pure; handles tags JSON, isPublicDomain
+  str→bool, objectID str→int.
+- `_row_passes_hf_filter(row) -> bool` — PD filter on raw HF row.
+- `HFIngestStats` dataclass with `as_dict()` and `total_persisted`.
+- `MetCDNCircuitBreakerError` for CDN image failures (distinct from
+  `MetAPIBannedError` which targets the Met API 403 path).
+- `_download_image(client, url, **kwargs)` — mockable seam for CDN fetches.
+- `ingest_met_hf_to_db(pool, *, rows, dry_run, circuit_breaker_threshold)`
+
+**Tags quirk:** The HF CSV stores `tags` as a JSON string (e.g.,
+`'[{"term":"Landscapes"}]'`) whereas the Met `/objects/{id}` API returns
+a list of dicts. `convert_hf_row` must handle `json.loads()` + null/empty
+gracefully before handing the dict to `map_met_record`. This is the single
+meaningful schema divergence between the HF dataset and the live API.

@@ -1445,3 +1445,28 @@ provides an adequate safety net.
 | ACA job definition (live) | `--request-delay` 0.015 → 0.1 |
 
 **Constraint conformance:** D-002, D-006, D-015, D-016, D-023, D-054.
+
+## D-066 — Met ingest region swap requires another region after East US 403 flatline
+
+**Date:** 2026-05-20  
+**Author:** backend-engineer  
+**Status:** Active
+
+### Problem
+
+West US 3 ACA egress remained permanently banned by the Met API after four backoff attempts. A fresh East US ACA deployment was tested to obtain a different egress pool and relaunch the `met-dump` ingest at `--request-delay 0.0133` (~75 req/s).
+
+### Decision
+
+Treat **East US** as another banned / unusable ACA region for Met ingest right now. Execution `art-guide-ingest-eastus-xl7vstp` failed within ~3 minutes with 50 consecutive `403 Forbidden` responses and tripped `MetAPIBannedError`; Met row count stayed at `100`.
+
+### Operational notes
+
+- New resources created: resource group `art-guide-ingest-eastus-rg`, environment `art-guide-ingest-eastus-env`, job `art-guide-ingest-eastus`.
+- The new job preserved the prod image and env flags, and used 2 vCPU / 4 GiB to match the existing West US 3 job rather than the lower 1 vCPU / 2 GiB example, avoiding the previously documented OOM risk.
+- `az containerapp job create --args` / `--command` on `azure-cli 2.83.0` + `containerapp 1.3.0b4` cannot reliably pass nested CLI flags like `--request-delay`; creating the job via `--yaml` is the reliable path for future region swaps.
+- The new job also required an explicit `AcrPull` role assignment for its system-assigned identity before image pulls could succeed.
+
+### Next step
+
+Try the next swap in a more distant region (North Europe, West Europe, or East Asia), keeping the same YAML-based create flow and checking execution logs for an immediate 403 flatline.

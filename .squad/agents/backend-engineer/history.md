@@ -107,4 +107,78 @@ az containerapp revision restart --name art-guide-prod-api -g art-guide-prod-rg 
 1. Met API bans operate at IP level, not request level. 403 flatline = IP ban; 429 + intermittent 200s = rate limit.
 2. Pre-flight gate (T-5 HTTP 200 from Met) can pass even if IP about to be banned; post-gate burst can trigger ban within seconds if rate is unsafe.
 3. Circuit breaker cost-benefit: detects ban state in <60s, preventing hours of wasted compute. Probe logic (object ID 1) works but can be sharpened with known-PD object in follow-up.
+4. **GitHub-hosted runner fallback (2026-05-19):** GitHub Actions is now the preferred Met bulk-ingest execution path because it avoids Azure egress IP bans while keeping the same `art-guide-ml ingest met-dump` CLI, prod Postgres target, and idempotent `--resume-skip-existing` semantics. Exposing the circuit-breaker threshold as a CLI flag lets operators tune fail-fast behavior from the workflow boundary without patching Python code.
+
+## Region swap for Met ACA ingest — 2026-05-20T01:33:51Z
+
+- Read the current West US 3 job config from `art-guide-prod-ingest`: image `artguideprodcr.azurecr.io/art-guide-api:latest`, command `art-guide-ml ingest met-dump --limit 0 --request-delay 0.05 --batch-commit-size 64 --batch-size 4 --resume-skip-existing`, envs `DATABASE_URL` / `ENV=prod` / offline HF cache flags, resources 2 vCPU / 4 GiB, manual trigger, parallelism 1.
+- Deployed a fresh East US ACA job: resource group `art-guide-ingest-eastus-rg`, environment `art-guide-ingest-eastus-env`, job `art-guide-ingest-eastus`.
+- Azure CLI gotcha: on `azure-cli 2.83.0` + `containerapp 1.3.0b4`, `az containerapp job create --args ... --request-delay ...` and full `--command ... --request-delay ...` both rejected flag-like tokens as top-level CLI args. Reliable workaround: create the job via `az containerapp job create --yaml`.
+- Infra gotcha: the new job required a system-assigned identity plus explicit `AcrPull` on `artguideprodcr` before start.
+- Started execution `art-guide-ingest-eastus-xl7vstp` at `2026-05-20T01:26:39Z` with `--request-delay 0.0133` (~75 req/s).
+- Outcome: **failed within ~3 minutes**. Logs flatlined to `403 Forbidden` and ended with `ml.ingest.met_csv.MetAPIBannedError: Circuit breaker tripped: 50 consecutive 403s ... Azure egress IP is likely IP-banned.` Met row count stayed at `100`.
+- Conclusion: East US ACA is also unusable for Met ingest right now; next retry should move to another distant region (for example `northeurope`, `westeurope`, or `eastasia`).
+
+## Met HF adapter (v3 API-bypass) — 2026-05-19T19:20:44Z
+
+**Shipped:** `services/ml/ml/ingest/met_hf.py` — a new ingest adapter that streams
+the `metmuseum/openaccess` Hugging Face dataset, bypassing the Met Collection API
+entirely. Registered as `ingest met-hf` in `cli.py`. All 239 tests pass (40 new
+`test_met_hf` tests + 0 regressions).
+
+**Key design decisions:**
+- Uses `datasets>=2.14` with `streaming=True` — no full ~300 MB download before
+  iteration. Library handles parquet/CSV format detection automatically.
+- `convert_hf_row()` is the sole coercion function: `objectID` str→int,
+  `isPublicDomain` str→bool, `objectBeginDate`/`objectEndDate` str→int,
+  `tags` JSON string→list. All other field names already match the Met API exactly.
+- `map_met_record()` is called unchanged — output rows are identical to v1/v2.
+- Circuit breaker tracks consecutive CDN image failures (`MetCDNCircuitBreakerError`),
+  not API 403s (there are no API calls in this path).
+- Per-image `embed_bytes()` rather than `embed_batch()` — CDN download is the
+  bottleneck; batch overhead not worth the complexity here.
+- `--image-delay` / `--request-delay` (alias) for CDN politeness; default 0.1s.
+
+**Lessons:**
+- HF dataset field names match the Met API JSON response almost perfectly — the
+  only real divergence is `tags` as a JSON string. All other coercions
+  (`objectID`, `isPublicDomain`, date fields) are just CSV-vs-JSON format
+  differences, not schema differences.
+- Tests written ahead of implementation are a gift: `test_met_hf.py` fully
+  specified the public interface (`convert_hf_row`, `_row_passes_hf_filter`,
+  `HFIngestStats`, `MetCDNCircuitBreakerError`, `DEFAULT_CONSECUTIVE_CDN_FAIL_LIMIT`,
+  `ingest_met_hf_to_db`), including edge cases (tags=null, tags=malformed JSON,
+  empty primaryImageSmall, circuit breaker reset-on-success).
+- The `rows=` keyword argument on `ingest_met_hf_to_db` for test injection (vs.
+  live HF streaming) is the right seam: it keeps the core logic unit-testable
+  without any mocking of the `datasets` library itself.
+
+
+## Met ingest circuit breaker + rate fix — 2026-05-17T23:09:26Z
+
+**Session:** Scribe processed backend-engineer's ingest diagnosis.
+
+**Status update:**
+- D-065 committed to decisions log: circuit breaker deployed, request delay corrected from 66 req/s → 10 req/s.
+- Met API IP still banned; recovery expected ~01:00Z UTC (Monday).
+- Circuit breaker (`MetAPIBannedError`) validated: execution `fw140av` failed cleanly in 50s vs. prior 3h silent drain.
+- **Safe rate confirmed:** 10 req/s (0.1s delay) per Met API 80 req/s documentation; 0.1s margin applied.
+- DB state stable: 21,194 rows (100 met, 14,504 aic, 6,590 rijks). Resumption will skip existing via `--resume-skip-existing` flag.
+- Heartbeat v2 (15m interval) monitors for circuit-breaker patterns; escalates if 4+ trips within 1h.
+
+**Lessons consolidated:**
+1. Met API bans operate at IP level, not request level. 403 flatline = IP ban; 429 + intermittent 200s = rate limit.
+2. Pre-flight gate (T-5 HTTP 200 from Met) can pass even if IP about to be banned; post-gate burst can trigger ban within seconds if rate is unsafe.
+3. Circuit breaker cost-benefit: detects ban state in <60s, preventing hours of wasted compute. Probe logic (object ID 1) works but can be sharpened with known-PD object in follow-up.
+4. **GitHub-hosted runner fallback (2026-05-19):** GitHub Actions is now the preferred Met bulk-ingest execution path because it avoids Azure egress IP bans while keeping the same `art-guide-ml ingest met-dump` CLI, prod Postgres target, and idempotent `--resume-skip-existing` semantics. Exposing the circuit-breaker threshold as a CLI flag lets operators tune fail-fast behavior from the workflow boundary without patching Python code.
+
+## Region swap for Met ACA ingest — 2026-05-20T01:33:51Z
+
+- Read the current West US 3 job config from `art-guide-prod-ingest`: image `artguideprodcr.azurecr.io/art-guide-api:latest`, command `art-guide-ml ingest met-dump --limit 0 --request-delay 0.05 --batch-commit-size 64 --batch-size 4 --resume-skip-existing`, envs `DATABASE_URL` / `ENV=prod` / offline HF cache flags, resources 2 vCPU / 4 GiB, manual trigger, parallelism 1.
+- Deployed a fresh East US ACA job: resource group `art-guide-ingest-eastus-rg`, environment `art-guide-ingest-eastus-env`, job `art-guide-ingest-eastus`.
+- Azure CLI gotcha: on `azure-cli 2.83.0` + `containerapp 1.3.0b4`, `az containerapp job create --args ... --request-delay ...` and full `--command ... --request-delay ...` both rejected flag-like tokens as top-level CLI args. Reliable workaround: create the job via `az containerapp job create --yaml`.
+- Infra gotcha: the new job required a system-assigned identity plus explicit `AcrPull` on `artguideprodcr` before start.
+- Started execution `art-guide-ingest-eastus-xl7vstp` at `2026-05-20T01:26:39Z` with `--request-delay 0.0133` (~75 req/s).
+- Outcome: **failed within ~3 minutes**. Logs flatlined to `403 Forbidden` and ended with `ml.ingest.met_csv.MetAPIBannedError: Circuit breaker tripped: 50 consecutive 403s ... Azure egress IP is likely IP-banned.` Met row count stayed at `100`.
+- Conclusion: East US ACA is also unusable for Met ingest right now; next retry should move to another distant region (for example `northeurope`, `westeurope`, or `eastasia`).
 
