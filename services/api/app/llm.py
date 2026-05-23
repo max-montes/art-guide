@@ -315,7 +315,7 @@ async def _chat_complete(client, settings: Settings, prompt: str, *, timeout_s: 
     kwargs = dict(
         model=settings.AZURE_OPENAI_DEPLOYMENT,
         messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=1500,
+        max_completion_tokens=400,
         timeout=timeout_s,
     )
     result = create(**kwargs)

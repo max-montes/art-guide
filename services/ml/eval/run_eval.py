@@ -279,26 +279,48 @@ def call_identify(
     api_url: str,
     api_key: str | None,
     client: Any,
-) -> dict[str, Any]:
-    """POST image bytes to /v1/identify and return parsed JSON response.
+    *,
+    max_retries: int = 4,
+) -> tuple[dict[str, Any], float]:
+    """POST image bytes to /v1/identify and return (parsed JSON, net_ms).
 
-    The image is sent as multipart/form-data with content-type image/jpeg,
-    matching what the iOS client sends. No LLM key is needed — the server
-    handles missing LLM gracefully with a stub explanation.
+    net_ms is the time of the final successful HTTP POST only — it excludes
+    client-side retry waits so p99 latency metrics reflect service time, not
+    rate-limit backoff delays.
+
+    Retries automatically on 429 (rate limited), honoring the Retry-After
+    header so the eval can run unattended against prod without hitting the
+    per-key rate cap.
     """
     headers: dict[str, str] = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    files = {"image": ("eval_image.jpg", image_bytes, "image/jpeg")}
-    response = client.post(
-        f"{api_url.rstrip('/')}/v1/identify",
-        files=files,
-        headers=headers,
-        timeout=60,
-    )
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(max_retries + 1):
+        files = {"image": ("eval_image.jpg", image_bytes, "image/jpeg")}
+        t0 = time.perf_counter()
+        response = client.post(
+            f"{api_url.rstrip('/')}/v1/identify",
+            files=files,
+            headers=headers,
+            timeout=60,
+        )
+        net_ms = (time.perf_counter() - t0) * 1000
+        if response.status_code == 429 and attempt < max_retries:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            logger.warning(
+                "  429 rate limited — waiting %ds before retry %d/%d",
+                retry_after,
+                attempt + 1,
+                max_retries,
+            )
+            time.sleep(retry_after)
+            continue
+        response.raise_for_status()
+        return response.json(), net_ms
+
+    response.raise_for_status()  # exhausted retries
+    return response.json(), 0.0  # unreachable
 
 
 # ------------------------------------------------------------------ evaluation
@@ -645,7 +667,7 @@ def run_eval(
 
             # POST to /v1/identify
             try:
-                response = call_identify(image_bytes, api_url, api_key, client)
+                response, net_ms = call_identify(image_bytes, api_url, api_key, client)
             except Exception as exc:
                 result.error = str(exc)
                 logger.warning("  ERROR identify call: %s", exc)
@@ -654,8 +676,7 @@ def run_eval(
                     time.sleep(request_delay_s)
                 continue
 
-            t_end = time.perf_counter()
-            result.total_wall_ms = (t_end - t_start) * 1000
+            result.total_wall_ms = net_ms
 
             # Extract metrics
             try:

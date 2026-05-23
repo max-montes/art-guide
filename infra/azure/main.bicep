@@ -269,10 +269,11 @@ resource containerApp 'Microsoft.App/containerApps@2023-05-01' = {
             { name: 'DB_POOL_MIN_SIZE',            value: '1' }
             { name: 'DB_POOL_MAX_SIZE',            value: '5' }
             { name: 'PROMPT_LOG_SAMPLE_RATE',      value: '1.0' }
+            { name: 'RATE_LIMIT_REQUESTS',         value: '100' }
           ]
         }
       ]
-      scale: { minReplicas: 0, maxReplicas: 2 }
+      scale: { minReplicas: 1, maxReplicas: 2 }
     }
   }
 }
@@ -315,14 +316,27 @@ resource raStorageBlobContrib 'Microsoft.Authorization/roleAssignments@2022-04-0
 
 // ── Phase 3b: Container Apps Job — Met full-catalog ingest ───────────────────
 //
-// Manual-trigger job that runs `art-guide-ml ingest met --limit 0` to ingest
-// the full Met Open Access catalog (~500K records) into prod Postgres+pgvector.
+// Manual-trigger job that runs `art-guide-ml ingest met` (limit=0 → unlimited)
+// to ingest the full Met Open Access catalog (~500K records) into prod
+// Postgres+pgvector.
 //
-// Same ACR image as the API (artguideprodcr.azurecr.io/art-guide-api:v1).
-// Overrides CMD to run the ML CLI instead of uvicorn.
-// 2 vCPU / 4 Gi — headroom for SigLIP model load + batch encoding.
-// replicaTimeout 7200 s (2 hr) — full catalog at ~6 req/s ≈ 23 h; set higher if
-// you plan to run the full pass without the default 6 req/s Met rate floor.
+// Path D — "respect the published rate limit from one sender" (D-053):
+// The Met's official rate limit (https://metmuseum.github.io/) is **80 requests
+// per second per IP**. Previous parallel attempts (4-8 replicas × per-replica
+// delays) summed *aggregate* req/s above 80 and got the Azure egress IP
+// silently 403-throttled (Met returns 403 — not 429 — when over the per-IP
+// cap, with a multi-hour cooldown). The fix is the OPPOSITE of parallelism:
+// drop to a single worker pushing ~66 req/s (request_delay=0.015s), well
+// under the 80 req/s ceiling. Single worker on full 501,696-record catalog
+// projects ~2 hr at this rate (501k / 66 / 60 ≈ 127 min). No sharding needed.
+//
+// Image: art-guide-api:v4 — already contains the limit=0=unlimited bugfix
+// AND the "don't-retry-4xx-non-429" fix that prevents per-record permanent
+// 403/404s from eating 30s of exponential backoff per record.
+//
+// Same ACR image as the API repo. Overrides CMD to run the ML CLI instead
+// of uvicorn. 2 vCPU / 4 Gi per replica — headroom for SigLIP model load.
+// replicaTimeout 14400 s (4 hr) — generous ceiling for the ~2 hr expected run.
 //
 // Deploy the job:
 //   az deployment group create -g art-guide-prod-rg -f infra/azure/main.bicep \
@@ -345,8 +359,17 @@ resource ingestJob 'Microsoft.App/jobs@2023-05-01' = {
     environmentId: containerAppsEnv.id
     configuration: {
       triggerType: 'Manual'
-      replicaTimeout: 7200
+      replicaTimeout: 14400
       replicaRetryLimit: 1
+      // Path D (D-053): single worker. Parallelism was the wrong fix — adding
+      // replicas without respecting the per-IP rate cap (80 req/s, official)
+      // triggered Met's IP-throttle and silent 403-storms with multi-hour
+      // cooldowns. One sender at 66 req/s (< 80) covers the full 501K
+      // catalog in ~2 hr fetch-bound.
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
       registries: [
         {
           server: '${acrName}.azurecr.io'
@@ -361,21 +384,32 @@ resource ingestJob 'Microsoft.App/jobs@2023-05-01' = {
       containers: [
         {
           name: 'ingest'
-          image: '${acrName}.azurecr.io/art-guide-api:v1'
+          image: '${acrName}.azurecr.io/art-guide-api:latest'
           resources: {
             cpu: json('2')
             memory: '4Gi'
           }
           // Override CMD: run the ML CLI instead of uvicorn.
-          // --limit 0 = full corpus; --batch-commit-size 64 = commits per txn.
+          //   met-dump               → v2 CSV dump path (pre-filters ~50% of rows before API calls)
+          //   --limit 0              → unlimited (process every id)
+          //   --request-delay 0.015  → ~66 req/s, under Met's 80 req/s cap
+          //   --batch-commit-size 64 → commits per txn (unchanged from D-046)
+          //   --batch-size 4         → CPU embed sweet spot (no MPS on ACA)
+          //   --resume-skip-existing → skip already-embedded rows on restart
+          // No sharding flags — single worker means single shard (D-053).
           command: [
             'art-guide-ml'
             'ingest'
-            'met'
+            'met-dump'
             '--limit'
             '0'
+            '--request-delay'
+            '0.015'
             '--batch-commit-size'
             '64'
+            '--batch-size'
+            '4'
+            '--resume-skip-existing'
           ]
           env: [
             { name: 'DATABASE_URL',          secretRef: 'database-url' }
