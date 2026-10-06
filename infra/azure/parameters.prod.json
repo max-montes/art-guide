@@ -33,7 +33,7 @@
       "value": "2026-05-01"
     },
     "apiImage": {
-      "value": "artguideprodcr.azurecr.io/art-guide-api:v2"
+      "value": "artguideprodcr.azurecr.io/art-guide-api:v3"
     },
     "apiCpu": {
       "value": "1.0"

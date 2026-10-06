@@ -57,7 +57,7 @@ param budgetStartDate   string = '2026-05-01'   // YYYY-MM-01; updated each cale
 //     D-NEW: these params were introduced to prevent Bicep re-deploys from
 //     accidentally resetting the container to a sample/hello-world image.
 //
-param apiImage     string = 'artguideprodcr.azurecr.io/art-guide-api:v2'
+param apiImage     string = 'artguideprodcr.azurecr.io/art-guide-api:v3'
 param apiCpu       string = '1.0'
 param apiMemory    string = '2Gi'
 param containerPort int   = 8000
@@ -217,7 +217,7 @@ resource kvSecretDatabaseUrl 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
 
 // ── Phase 3: Compute — Container App with real API image ──────────────────────
 //
-// Image param: apiImage (default artguideprodcr.azurecr.io/art-guide-api:v1).
+// Image param: apiImage (default artguideprodcr.azurecr.io/art-guide-api:v3).
 // Sizing param: apiCpu / apiMemory. Pull via system-assigned managed identity.
 // Built in D-028. AcrPull RBAC wired below.
 
@@ -326,9 +326,9 @@ resource raStorageBlobContrib 'Microsoft.Authorization/roleAssignments@2022-04-0
 // delays) summed *aggregate* req/s above 80 and got the Azure egress IP
 // silently 403-throttled (Met returns 403 — not 429 — when over the per-IP
 // cap, with a multi-hour cooldown). The fix is the OPPOSITE of parallelism:
-// drop to a single worker pushing ~66 req/s (request_delay=0.015s), well
+// drop to a single worker pushing ~20 req/s (request_delay=0.05s), well
 // under the 80 req/s ceiling. Single worker on full 501,696-record catalog
-// projects ~2 hr at this rate (501k / 66 / 60 ≈ 127 min). No sharding needed.
+// projects ~7 hr at this rate. No sharding needed.
 //
 // Image: art-guide-api:v4 — already contains the limit=0=unlimited bugfix
 // AND the "don't-retry-4xx-non-429" fix that prevents per-record permanent
@@ -364,8 +364,8 @@ resource ingestJob 'Microsoft.App/jobs@2023-05-01' = {
       // Path D (D-053): single worker. Parallelism was the wrong fix — adding
       // replicas without respecting the per-IP rate cap (80 req/s, official)
       // triggered Met's IP-throttle and silent 403-storms with multi-hour
-      // cooldowns. One sender at 66 req/s (< 80) covers the full 501K
-      // catalog in ~2 hr fetch-bound.
+      // cooldowns. One sender at 20 req/s (< 80) covers the full 501K
+      // catalog in ~7 hr fetch-bound.
       manualTriggerConfig: {
         parallelism: 1
         replicaCompletionCount: 1
@@ -392,7 +392,7 @@ resource ingestJob 'Microsoft.App/jobs@2023-05-01' = {
           // Override CMD: run the ML CLI instead of uvicorn.
           //   met-dump               → v2 CSV dump path (pre-filters ~50% of rows before API calls)
           //   --limit 0              → unlimited (process every id)
-          //   --request-delay 0.015  → ~66 req/s, under Met's 80 req/s cap
+          //   --request-delay 0.05   → ~20 req/s, under Met's 80 req/s cap
           //   --batch-commit-size 64 → commits per txn (unchanged from D-046)
           //   --batch-size 4         → CPU embed sweet spot (no MPS on ACA)
           //   --resume-skip-existing → skip already-embedded rows on restart
@@ -404,7 +404,7 @@ resource ingestJob 'Microsoft.App/jobs@2023-05-01' = {
             '--limit'
             '0'
             '--request-delay'
-            '0.015'
+            '0.05'
             '--batch-commit-size'
             '64'
             '--batch-size'
@@ -442,6 +442,81 @@ resource raAcrPullJob 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleAcrPull)
     principalId: ingestJob.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ── Phase 3c: Container Apps Job — Mitsua diffusion image ingest ─────────────
+
+resource mitsuaIngestJob 'Microsoft.App/jobs@2023-05-01' = {
+  name: '${prefix}-mitsua-ingest'
+  location: location
+  tags: tags
+  identity: { type: 'SystemAssigned' }
+  properties: {
+    environmentId: containerAppsEnv.id
+    configuration: {
+      triggerType: 'Manual'
+      replicaTimeout: 14400
+      replicaRetryLimit: 1
+      manualTriggerConfig: {
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: '${acrName}.azurecr.io'
+          identity: 'system'
+        }
+      ]
+      secrets: [
+        { name: 'database-url', value: dbUrl }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'ingest'
+          image: '${acrName}.azurecr.io/art-guide-api:latest'
+          resources: {
+            cpu: json('2')
+            memory: '4Gi'
+          }
+          command: [
+            'art-guide-ml'
+            'ingest'
+            'mitsua-hf'
+            '--skip-existing-sources'
+          ]
+          env: [
+            { name: 'DATABASE_URL',         secretRef: 'database-url' }
+            { name: 'ENV',                  value: 'prod' }
+            { name: 'HF_HUB_OFFLINE',       value: '0' }
+            { name: 'TRANSFORMERS_OFFLINE', value: '0' }
+            { name: 'HF_HOME',              value: '/opt/hf-cache' }
+          ]
+        }
+      ]
+    }
+  }
+}
+
+resource raKvSecretsUserMitsuaJob 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(kv.id, mitsuaIngestJob.id, roleKvSecretsUser)
+  scope: kv
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleKvSecretsUser)
+    principalId: mitsuaIngestJob.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource raAcrPullMitsuaJob 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, mitsuaIngestJob.id, roleAcrPull)
+  scope: acr
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleAcrPull)
+    principalId: mitsuaIngestJob.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -487,3 +562,4 @@ output containerAppPrincipalId string = containerApp.identity.principalId
 output resourceGroupName     string = resourceGroup().name
 output storageAccountName    string = storage.name
 output ingestJobName         string = ingestJob.name
+output mitsuaIngestJobName   string = mitsuaIngestJob.name
